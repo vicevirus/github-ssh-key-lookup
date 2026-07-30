@@ -1,0 +1,101 @@
+name: github-ssh-index
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: github_ssh_index
+      POSTGRES_USER: github_ssh_index
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U github_ssh_index -d github_ssh_index"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+    pids_limit: 256
+    stop_grace_period: 1m
+    logging: *default-logging
+
+  api:
+    build: .
+    restart: unless-stopped
+    command: ["api"]
+    environment:
+      DATABASE_URL: postgres://github_ssh_index:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/github_ssh_index?sslmode=disable&connect_timeout=5
+      HTTP_ADDR: :8080
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "github-ssh-index", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    pids_limit: 64
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging: *default-logging
+
+  crawler:
+    build: .
+    restart: unless-stopped
+    command: ["crawl"]
+    environment:
+      DATABASE_URL: postgres://github_ssh_index:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/github_ssh_index?sslmode=disable&connect_timeout=5
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?Set GITHUB_TOKEN in .env}
+      GITHUB_USER_AGENT: ${GITHUB_USER_AGENT:-github-ssh-index/1.0}
+      GRAPHQL_WORKERS: ${GRAPHQL_WORKERS:-4}
+      GRAPHQL_POINTS_PER_HOUR: ${GRAPHQL_POINTS_PER_HOUR:-3600}
+      REST_REQUESTS_PER_HOUR: ${REST_REQUESTS_PER_HOUR:-4700}
+      QUEUE_MAX_ACCOUNTS: ${QUEUE_MAX_ACCOUNTS:-10000}
+      TAIL_POLL_INTERVAL: ${TAIL_POLL_INTERVAL:-1m}
+      OWNER_REFRESH_INTERVAL: ${OWNER_REFRESH_INTERVAL:-168h}
+      ESTIMATED_ACCOUNTS_LOW: ${ESTIMATED_ACCOUNTS_LOW:-190000000}
+      ESTIMATED_ACCOUNTS_HIGH: ${ESTIMATED_ACCOUNTS_HIGH:-220000000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    pids_limit: 64
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging: *default-logging
+
+volumes:
+  postgres-data:
