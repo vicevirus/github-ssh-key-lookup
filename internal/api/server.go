@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,56 +90,135 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) users(response http.ResponseWriter, request *http.Request) {
-	afterID, limit, err := parsePagination(request.URL.Query())
+	page, err := parsePagination(request.URL.Query())
 	if err != nil {
 		writeJSON(response, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	users, err := s.Store.ListIndexedUsers(request.Context(), afterID, limit+1)
+	if page.Snapshot.IsZero() {
+		page.Snapshot, err = s.Store.SnapshotTime(request.Context())
+		if err != nil {
+			s.internalError(response, err)
+			return
+		}
+	}
+	users, err := s.Store.ListIndexedUsers(
+		request.Context(), page.AfterID, page.Snapshot, page.Limit+1,
+	)
 	if err != nil {
 		s.internalError(response, err)
 		return
 	}
-	hasMore := len(users) > limit
+	hasMore := len(users) > page.Limit
 	if hasMore {
-		users = users[:limit]
+		users = users[:page.Limit]
 	}
 	var nextAfterID *int64
+	var nextCursor, nextURL *string
 	if hasMore && len(users) > 0 {
 		nextAfterID = &users[len(users)-1].GitHubID
+		cursor := encodeCursor(*nextAfterID, page.Snapshot)
+		nextCursor = &cursor
+		target := nextPageURL(request, cursor, page.Limit)
+		nextURL = &target
+		response.Header().Set("Link", "<"+target+">; rel=\"next\"")
 	}
 	writeJSON(response, http.StatusOK, map[string]any{
 		"users":         users,
 		"count":         len(users),
-		"limit":         limit,
-		"after_id":      afterID,
+		"limit":         page.Limit,
+		"after_id":      page.AfterID,
 		"has_more":      hasMore,
 		"next_after_id": nextAfterID,
+		"next_cursor":   nextCursor,
+		"next_url":      nextURL,
+		"pagination": map[string]any{
+			"count":       len(users),
+			"limit":       page.Limit,
+			"has_more":    hasMore,
+			"next_cursor": nextCursor,
+			"next_url":    nextURL,
+		},
 	})
 }
 
-func parsePagination(values url.Values) (int64, int, error) {
+type paginationRequest struct {
+	AfterID  int64
+	Limit    int
+	Snapshot time.Time
+}
+
+func parsePagination(values url.Values) (paginationRequest, error) {
 	const (
 		defaultLimit = 100
 		maxLimit     = 200
 	)
-	limit := defaultLimit
+	page := paginationRequest{Limit: defaultLimit}
 	if raw := values.Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed < 1 || parsed > maxLimit {
-			return 0, 0, fmt.Errorf("limit must be between 1 and %d", maxLimit)
+			return paginationRequest{}, fmt.Errorf("limit must be between 1 and %d", maxLimit)
 		}
-		limit = parsed
+		page.Limit = parsed
 	}
-	var afterID int64
-	if raw := values.Get("after_id"); raw != "" {
-		parsed, err := strconv.ParseInt(raw, 10, 64)
+	rawCursor, rawAfterID := values.Get("cursor"), values.Get("after_id")
+	if rawCursor != "" && rawAfterID != "" {
+		return paginationRequest{}, errors.New("cursor and after_id cannot be used together")
+	}
+	if rawCursor != "" {
+		afterID, snapshot, err := decodeCursor(rawCursor)
+		if err != nil {
+			return paginationRequest{}, err
+		}
+		page.AfterID = afterID
+		page.Snapshot = snapshot
+	} else if rawAfterID != "" {
+		parsed, err := strconv.ParseInt(rawAfterID, 10, 64)
 		if err != nil || parsed < 0 {
-			return 0, 0, errors.New("after_id must be a non-negative integer")
+			return paginationRequest{}, errors.New("after_id must be a non-negative integer")
 		}
-		afterID = parsed
+		page.AfterID = parsed
 	}
-	return afterID, limit, nil
+	return page, nil
+}
+
+const cursorPayloadSize = 17
+
+func encodeCursor(afterID int64, snapshot time.Time) string {
+	payload := make([]byte, cursorPayloadSize)
+	payload[0] = 1
+	binary.BigEndian.PutUint64(payload[1:9], uint64(afterID))
+	binary.BigEndian.PutUint64(payload[9:17], uint64(snapshot.UnixMicro()))
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeCursor(raw string) (int64, time.Time, error) {
+	if len(raw) != base64.RawURLEncoding.EncodedLen(cursorPayloadSize) {
+		return 0, time.Time{}, errors.New("invalid cursor")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(payload) != cursorPayloadSize || payload[0] != 1 {
+		return 0, time.Time{}, errors.New("invalid cursor")
+	}
+	rawAfterID := binary.BigEndian.Uint64(payload[1:9])
+	if rawAfterID > uint64(1<<63-1) {
+		return 0, time.Time{}, errors.New("invalid cursor")
+	}
+	snapshot := time.UnixMicro(int64(binary.BigEndian.Uint64(payload[9:17]))).UTC()
+	earliest := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	latest := time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+	if snapshot.Before(earliest) || !snapshot.Before(latest) {
+		return 0, time.Time{}, errors.New("invalid cursor")
+	}
+	return int64(rawAfterID), snapshot, nil
+}
+
+func nextPageURL(request *http.Request, cursor string, limit int) string {
+	values := request.URL.Query()
+	values.Del("after_id")
+	values.Set("cursor", cursor)
+	values.Set("limit", strconv.Itoa(limit))
+	return request.URL.Path + "?" + values.Encode()
 }
 
 func (s *Server) lookupGET(response http.ResponseWriter, request *http.Request) {

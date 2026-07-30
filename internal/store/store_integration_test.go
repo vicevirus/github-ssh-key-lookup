@@ -180,7 +180,11 @@ func TestOverflowPagesFinalizeOnlyAfterLastPage(t *testing.T) {
 			t.Fatalf("overflow key not current: %#v", matches)
 		}
 	}
-	users, err := database.ListIndexedUsers(ctx, 0, 100)
+	snapshot, err := database.SnapshotTime(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, err := database.ListIndexedUsers(ctx, 0, snapshot, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,19 +219,51 @@ func TestIndexedUsersUseKeysetPagination(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	first, err := database.ListIndexedUsers(ctx, 0, 2)
+	snapshot, err := database.SnapshotTime(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := database.ListIndexedUsers(ctx, 0, snapshot, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first) != 2 || first[0].GitHubID != 10 || first[1].GitHubID != 20 {
 		t.Fatalf("unexpected first page: %#v", first)
 	}
-	second, err := database.ListIndexedUsers(ctx, first[1].GitHubID, 2)
+
+	late := model.Candidate{GitHubID: 25, NodeID: "U_LATE", Login: "owner-late"}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{late}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimAccounts(ctx, 100, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteAccounts(ctx, jobs, []*model.UserResult{{
+		NodeID: late.NodeID, GitHubID: late.GitHubID, Login: late.Login,
+		Keys: []model.PublicKey{parsedTestKey(t, 10)},
+	}}, 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := database.ListIndexedUsers(ctx, first[1].GitHubID, snapshot, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(second) != 1 || second[0].GitHubID != 30 {
-		t.Fatalf("unexpected second page: %#v", second)
+		t.Fatalf("snapshot changed between pages: %#v", second)
+	}
+
+	freshSnapshot, err := database.SnapshotTime(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := database.ListIndexedUsers(ctx, first[1].GitHubID, freshSnapshot, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh) != 2 || fresh[0].GitHubID != 25 || fresh[1].GitHubID != 30 {
+		t.Fatalf("fresh snapshot omitted late owner: %#v", fresh)
 	}
 }
 

@@ -929,15 +929,24 @@ func (s *Store) aliases(ctx context.Context, githubID int64) ([]Alias, error) {
 	return aliases, rows.Err()
 }
 
-func (s *Store) ListIndexedUsers(ctx context.Context, afterID int64, limit int) ([]IndexedUser, error) {
+func (s *Store) SnapshotTime(ctx context.Context) (time.Time, error) {
+	var snapshot time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT statement_timestamp()`).Scan(&snapshot)
+	return snapshot.UTC(), err
+}
+
+func (s *Store) ListIndexedUsers(
+	ctx context.Context, afterID int64, snapshot time.Time, limit int,
+) ([]IndexedUser, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT github_id, login, 'https://github.com/' || login,
 		       first_seen_at, last_seen_at, last_verified_at, inaccessible
 		FROM github_owners
 		WHERE github_id > $1
+		  AND first_seen_at <= $2
 		ORDER BY github_id
-		LIMIT $2
-	`, afterID, limit)
+		LIMIT $3
+	`, afterID, snapshot, limit)
 	if err != nil {
 		return nil, err
 	}
