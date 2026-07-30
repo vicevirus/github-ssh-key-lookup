@@ -143,7 +143,28 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.Pool.Exec(ctx, string(sql)); err != nil {
+
+	connection, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer connection.Release()
+
+	const migrationLockKey int64 = 742910238550
+	if _, err := connection.Exec(
+		ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey,
+	); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		unlockContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = connection.Exec(
+			unlockContext, `SELECT pg_advisory_unlock($1)`, migrationLockKey,
+		)
+	}()
+
+	if _, err := connection.Exec(ctx, string(sql)); err != nil {
 		return fmt.Errorf("apply database migration: %w", err)
 	}
 	return nil
