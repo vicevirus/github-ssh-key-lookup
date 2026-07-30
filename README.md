@@ -2,4 +2,4 @@
 
 Reverse lookup for public SSH keys associated with GitHub accounts.
 
-Idea originally by [Ramadhan Amizudin (RempahRZ)](https://github.com/ramadhanamizudin).
+Idea originally by [RempahRZ](https://github.com/ramadhanamizudin).
