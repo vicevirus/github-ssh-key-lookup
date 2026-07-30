@@ -32,14 +32,35 @@ func Parse(value string) (model.PublicKey, error) {
 
 func NormalizeFingerprint(value string) (string, error) {
 	value = strings.TrimSpace(value)
-	if !strings.HasPrefix(value, "SHA256:") {
-		key, err := Parse(value)
-		if err != nil {
-			return "", err
-		}
-		return key.Text, nil
+	if len(value) >= len("SHA256:") &&
+		strings.EqualFold(value[:len("SHA256:")], "SHA256:") {
+		return normalizeSHA256Digest(value[len("SHA256:"):])
 	}
-	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(value, "SHA256:"))
+
+	if len(value) == 43 || (len(value) == 44 && strings.HasSuffix(value, "=")) {
+		return normalizeSHA256Digest(value)
+	}
+
+	key, err := Parse(value)
+	if err != nil {
+		return "", err
+	}
+	return key.Text, nil
+}
+
+func normalizeSHA256Digest(encoded string) (string, error) {
+	var (
+		raw []byte
+		err error
+	)
+	switch {
+	case len(encoded) == 43:
+		raw, err = base64.RawStdEncoding.DecodeString(encoded)
+	case len(encoded) == 44 && strings.HasSuffix(encoded, "="):
+		raw, err = base64.StdEncoding.DecodeString(encoded)
+	default:
+		return "", errors.New("invalid SHA256 fingerprint length")
+	}
 	if err != nil {
 		return "", fmt.Errorf("invalid SHA256 fingerprint: %w", err)
 	}

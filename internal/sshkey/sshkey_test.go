@@ -42,15 +42,36 @@ func TestNormalizeFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := NormalizeFingerprint(key.Text)
-	if err != nil {
-		t.Fatal(err)
+
+	digest := strings.TrimPrefix(key.Text, "SHA256:")
+	for name, input := range map[string]string{
+		"canonical":        key.Text,
+		"bare":             digest,
+		"padded":           digest + "=",
+		"lowercase prefix": "sha256:" + digest,
+		"complete key":     testKey(t),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := NormalizeFingerprint(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != key.Text {
+				t.Fatalf("got %q want %q", got, key.Text)
+			}
+		})
 	}
-	if got != key.Text {
-		t.Fatalf("got %q want %q", got, key.Text)
-	}
-	if _, err := NormalizeFingerprint("SHA256:" + base64.RawStdEncoding.EncodeToString([]byte("short"))); err == nil {
-		t.Fatal("accepted short fingerprint")
+
+	for name, input := range map[string]string{
+		"short prefixed": "SHA256:" + base64.RawStdEncoding.EncodeToString([]byte("short")),
+		"invalid bare":   strings.Repeat("!", 43),
+		"extra padding":  digest + "==",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NormalizeFingerprint(input); err == nil {
+				t.Fatalf("accepted invalid fingerprint %q", input)
+			}
+		})
 	}
 }
 
