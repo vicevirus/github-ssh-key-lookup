@@ -46,6 +46,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS crawl_runs_one_active_main
 ON crawl_runs ((status))
 WHERE status = 'running';
 
+CREATE TABLE IF NOT EXISTS enumeration_shards (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES crawl_runs(id) ON DELETE CASCADE,
+    lower_id BIGINT NOT NULL,
+    upper_id BIGINT NOT NULL,
+    next_since_id BIGINT NOT NULL,
+    next_url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'running', 'retry', 'completed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    enumerated_users BIGINT NOT NULL DEFAULT 0,
+    claimed_at TIMESTAMPTZ,
+    last_error TEXT,
+    last_error_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    UNIQUE (run_id, lower_id, upper_id)
+);
+
+CREATE INDEX IF NOT EXISTS enumeration_shards_claim_idx
+ON enumeration_shards (run_id, status, id);
+
 CREATE TABLE IF NOT EXISTS account_queue (
     id BIGSERIAL PRIMARY KEY,
     run_id BIGINT REFERENCES crawl_runs(id) ON DELETE CASCADE,
