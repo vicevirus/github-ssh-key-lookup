@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +100,12 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour)
 	config.TailPollInterval = envDuration("TAIL_POLL_INTERVAL", config.TailPollInterval)
 	config.OwnerRefresh = envDuration("OWNER_REFRESH_INTERVAL", config.OwnerRefresh)
+	config.OwnerSchedule = envDurations(
+		"OWNER_REFRESH_SCHEDULE", config.OwnerSchedule,
+	)
+	config.ZeroKeyRecheckAges = envDurations(
+		"ZERO_KEY_RECHECK_AGES", config.ZeroKeyRecheckAges,
+	)
 	config.EstimatedAccountsLow = int64(envInt(
 		"ESTIMATED_ACCOUNTS_LOW", int(config.EstimatedAccountsLow),
 	))
@@ -151,4 +158,21 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func envDurations(key string, fallback []time.Duration) []time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parts := strings.Split(value, ",")
+	result := make([]time.Duration, 0, len(parts))
+	for _, part := range parts {
+		parsed, err := time.ParseDuration(strings.TrimSpace(part))
+		if err != nil || parsed <= 0 {
+			return fallback
+		}
+		result = append(result, parsed)
+	}
+	return result
 }

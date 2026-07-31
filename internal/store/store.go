@@ -374,7 +374,7 @@ func (s *Store) ApplyEnumerationPage(
 		    enumeration_complete = enumeration_complete OR $4,
 		    enumerated_users = enumerated_users + $5,
 		    cutoff_user_id = CASE
-		      WHEN kind = 'initial' AND $4 THEN $2
+		      WHEN kind = 'initial' AND $4 THEN COALESCE(cutoff_user_id, $2)
 		      ELSE cutoff_user_id
 		    END
 		WHERE id = $1
@@ -383,7 +383,7 @@ func (s *Store) ApplyEnumerationPage(
 		return err
 	}
 	if run.Kind == "initial" && complete {
-		if err := setStateTx(ctx, tx, "tail_highwater", strconv.FormatInt(nextSince, 10)); err != nil {
+		if err := setStateMaxIntTx(ctx, tx, "tail_highwater", nextSince); err != nil {
 			return err
 		}
 		if err := setStateTx(ctx, tx, "initial_enumerated", "true"); err != nil {
@@ -399,18 +399,54 @@ func (s *Store) QueueDepth(ctx context.Context) (int, error) {
 	return count, err
 }
 
+func (s *Store) QueueDepthByClass(ctx context.Context, class string) (int, error) {
+	var count int
+	err := s.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM account_queue
+		WHERE CASE $1
+		  WHEN 'global' THEN source = 'global'
+		  WHEN 'live' THEN source IN ('tail', 'onboarding')
+		  WHEN 'owner' THEN source = 'priority'
+		  ELSE true
+		END
+	`, class).Scan(&count)
+	return count, err
+}
+
 func (s *Store) ClaimAccounts(ctx context.Context, limit int, preferPriority bool) ([]model.Candidate, error) {
+	preferred := "global"
+	if preferPriority {
+		preferred = "owner"
+	}
+	return s.ClaimScheduledAccounts(ctx, limit, preferred)
+}
+
+func (s *Store) ClaimScheduledAccounts(
+	ctx context.Context,
+	limit int,
+	preferred string,
+) ([]model.Candidate, error) {
 	rows, err := s.Pool.Query(ctx, `
 		WITH picked AS (
 		  SELECT id
 		  FROM account_queue
 		  WHERE status IN ('pending', 'retry')
-		  ORDER BY CASE source
-		             WHEN 'tail' THEN 0
-		             WHEN 'priority' THEN CASE WHEN $2 THEN 1 ELSE 3 END
-		             WHEN 'global' THEN 2
-		             ELSE 4
-		           END, id
+		  ORDER BY
+		    CASE
+		      WHEN $2 = 'global' AND source = 'global' THEN 0
+		      WHEN $2 = 'live' AND source IN ('tail', 'onboarding') THEN 0
+		      WHEN $2 = 'owner' AND source = 'priority' THEN 0
+		      ELSE 1
+		    END,
+		    CASE source
+		      WHEN 'tail' THEN 0
+		      WHEN 'onboarding' THEN 1
+		      WHEN 'priority' THEN 2
+		      WHEN 'global' THEN 3
+		      ELSE 4
+		    END,
+		    id
 		  FOR UPDATE SKIP LOCKED
 		  LIMIT $1
 		)
@@ -421,7 +457,7 @@ func (s *Store) ClaimAccounts(ctx context.Context, limit int, preferPriority boo
 		WHERE q.id = picked.id
 		RETURNING q.id, q.run_id, q.source, q.github_id,
 		          q.node_id, q.login, q.scan_id::text, q.attempts
-	`, limit, preferPriority)
+	`, limit, preferred)
 	if err != nil {
 		return nil, err
 	}
@@ -463,10 +499,12 @@ func (s *Store) ApplyTailPage(
 			return err
 		}
 	}
+	if err := setStateMaxIntTx(ctx, tx, "tail_highwater", highwater); err != nil {
+		return err
+	}
 	for key, value := range map[string]string{
-		"tail_highwater": strconv.FormatInt(highwater, 10),
-		"tail_url":       nextURL,
-		"tail_etag":      etag,
+		"tail_url":  nextURL,
+		"tail_etag": etag,
 	} {
 		if err := setStateTx(ctx, tx, key, value); err != nil {
 			return err
@@ -475,11 +513,68 @@ func (s *Store) ApplyTailPage(
 	return tx.Commit(ctx)
 }
 
+func (s *Store) InitializeLiveTail(
+	ctx context.Context,
+	cutoff int64,
+	tailURL string,
+) (bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var initialized bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM runtime_state
+		  WHERE key = 'live_tail_initialized' AND value = 'true'
+		)
+	`).Scan(&initialized); err != nil {
+		return false, err
+	}
+	if initialized {
+		return false, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE crawl_runs
+		SET cutoff_user_id = COALESCE(cutoff_user_id, $1)
+		WHERE kind = 'initial' AND status = 'running'
+	`, cutoff); err != nil {
+		return false, err
+	}
+	for key, value := range map[string]string{
+		"tail_highwater":        strconv.FormatInt(cutoff, 10),
+		"tail_url":              tailURL,
+		"tail_etag":             "",
+		"live_tail_initialized": "true",
+	} {
+		if err := setStateTx(ctx, tx, key, value); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) CompleteAccounts(
 	ctx context.Context,
 	jobs []model.Candidate,
 	results []*model.UserResult,
 	ownerRefresh time.Duration,
+) error {
+	return s.CompleteAccountsScheduled(
+		ctx, jobs, results, []time.Duration{ownerRefresh}, nil,
+	)
+}
+
+func (s *Store) CompleteAccountsScheduled(
+	ctx context.Context,
+	jobs []model.Candidate,
+	results []*model.UserResult,
+	ownerSchedule []time.Duration,
+	zeroKeyAges []time.Duration,
 ) error {
 	if len(jobs) != len(results) {
 		return errors.New("jobs/results length mismatch")
@@ -505,7 +600,9 @@ func (s *Store) CompleteAccounts(
 			return err
 		}
 		if len(result.Keys) > 0 || ownerExists {
-			if err := upsertOwner(ctx, tx, job, result.Login, ownerRefresh); err != nil {
+			if err := upsertOwner(
+				ctx, tx, job, result.Login, scheduleDuration(ownerSchedule, 0),
+			); err != nil {
 				return err
 			}
 			for _, key := range result.Keys {
@@ -530,8 +627,33 @@ func (s *Store) CompleteAccounts(
 				if err != nil {
 					return err
 				}
-			} else if err := finalizeObservation(ctx, tx, job.GitHubID, job.ScanID, ownerRefresh); err != nil {
+			} else if err := finalizeObservation(
+				ctx, tx, job.GitHubID, job.ScanID, ownerSchedule,
+			); err != nil {
 				return err
+			}
+		}
+		if len(result.Keys) > 0 || ownerExists {
+			if _, err := tx.Exec(
+				ctx, `DELETE FROM zero_key_rechecks WHERE github_id = $1`,
+				job.GitHubID,
+			); err != nil {
+				return err
+			}
+		} else {
+			switch job.Source {
+			case "tail":
+				if err := scheduleZeroKeyRecheck(
+					ctx, tx, job, result.Login, zeroKeyAges,
+				); err != nil {
+					return err
+				}
+			case "onboarding":
+				if err := advanceZeroKeyRecheck(
+					ctx, tx, job.GitHubID, result.Login, zeroKeyAges,
+				); err != nil {
+					return err
+				}
 			}
 		}
 		classification := "zero"
@@ -552,13 +674,15 @@ func upsertOwner(ctx context.Context, tx pgx.Tx, job model.Candidate, login stri
 	_, err := tx.Exec(ctx, `
 		INSERT INTO github_owners (
 		  github_id, node_id, login, first_seen_at, last_seen_at,
-		  next_priority_scan_at, inaccessible
-		) VALUES ($1, $2, $3, now(), now(), now() + $4::interval, false)
+		  next_priority_scan_at, refresh_stage, last_changed_at, inaccessible
+		) VALUES (
+		  $1, $2, $3, now(), now(), now() + $4::interval,
+		  0, now(), false
+		)
 		ON CONFLICT (github_id) DO UPDATE SET
 		  node_id = excluded.node_id,
 		  login = excluded.login,
 		  last_seen_at = now(),
-		  next_priority_scan_at = now() + $4::interval,
 		  inaccessible = false
 	`, job.GitHubID, job.NodeID, login, pgInterval(refresh))
 	if err != nil {
@@ -597,36 +721,165 @@ func observeKey(ctx context.Context, tx pgx.Tx, githubID int64, scanID string, k
 		INSERT INTO github_owner_keys (
 		  github_id, fingerprint_sha256, first_seen_at, last_seen_at,
 		  last_verified_at, currently_present, removed_at,
-		  last_observation_scan
-		) VALUES ($1, $2, now(), now(), now(), true, NULL, $3::uuid)
+		  last_observation_scan, state_changed_scan
+		) VALUES (
+		  $1, $2, now(), now(), now(), true, NULL, $3::uuid, $3::uuid
+		)
 		ON CONFLICT (github_id, fingerprint_sha256) DO UPDATE SET
 		  last_seen_at = now(),
 		  last_verified_at = now(),
 		  currently_present = true,
 		  removed_at = NULL,
-		  last_observation_scan = $3::uuid
+		  last_observation_scan = $3::uuid,
+		  state_changed_scan = CASE
+		    WHEN NOT github_owner_keys.currently_present THEN $3::uuid
+		    ELSE github_owner_keys.state_changed_scan
+		  END
 	`, githubID, key.Fingerprint, scanID)
 	return err
 }
 
-func finalizeObservation(ctx context.Context, tx pgx.Tx, githubID int64, scanID string, refresh time.Duration) error {
+func finalizeObservation(
+	ctx context.Context,
+	tx pgx.Tx,
+	githubID int64,
+	scanID string,
+	ownerSchedule []time.Duration,
+) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE github_owner_keys
 		SET currently_present = false,
 		    removed_at = COALESCE(removed_at, now()),
-		    last_verified_at = now()
+		    last_verified_at = now(),
+		    state_changed_scan = $2::uuid
 		WHERE github_id = $1
 		  AND currently_present
 		  AND last_observation_scan <> $2::uuid
 	`, githubID, scanID); err != nil {
 		return err
 	}
+	var changed bool
+	var currentStage int
+	if err := tx.QueryRow(ctx, `
+		SELECT
+		  EXISTS (
+		    SELECT 1
+		    FROM github_owner_keys
+		    WHERE github_id = $1 AND state_changed_scan = $2::uuid
+		  ),
+		  refresh_stage
+		FROM github_owners
+		WHERE github_id = $1
+	`, githubID, scanID).Scan(&changed, &currentStage); err != nil {
+		return err
+	}
+	nextStage := currentStage
+	if changed {
+		nextStage = 0
+	} else if nextStage < len(ownerSchedule)-1 {
+		nextStage++
+	}
+	refresh := scheduleDuration(ownerSchedule, nextStage)
 	_, err := tx.Exec(ctx, `
 		UPDATE github_owners
 		SET last_verified_at = now(),
-		    next_priority_scan_at = now() + $2::interval
+		    refresh_stage = $2,
+		    last_changed_at = CASE WHEN $3 THEN now() ELSE last_changed_at END,
+		    next_priority_scan_at =
+		      now() + $4::interval +
+		      make_interval(secs => mod(github_id, 900)::int)
 		WHERE github_id = $1
-	`, githubID, pgInterval(refresh))
+	`, githubID, nextStage, changed, pgInterval(refresh))
+	return err
+}
+
+func scheduleDuration(schedule []time.Duration, stage int) time.Duration {
+	if len(schedule) == 0 {
+		return 7 * 24 * time.Hour
+	}
+	if stage < 0 {
+		stage = 0
+	}
+	if stage >= len(schedule) {
+		stage = len(schedule) - 1
+	}
+	if schedule[stage] <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return schedule[stage]
+}
+
+func scheduleZeroKeyRecheck(
+	ctx context.Context,
+	tx pgx.Tx,
+	job model.Candidate,
+	login string,
+	ages []time.Duration,
+) error {
+	if len(ages) == 0 {
+		return nil
+	}
+	if login == "" {
+		login = job.Login
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO zero_key_rechecks (
+		  github_id, node_id, login, stage, first_checked_at,
+		  last_checked_at, next_scan_at, expires_at
+		) VALUES (
+		  $1, $2, $3, 0, now(), now(),
+		  now() + $4::interval, now() + $5::interval
+		)
+		ON CONFLICT (github_id) DO UPDATE SET
+		  node_id = excluded.node_id,
+		  login = excluded.login,
+		  last_checked_at = now()
+	`, job.GitHubID, job.NodeID, login,
+		pgInterval(ages[0]), pgInterval(ages[len(ages)-1]))
+	return err
+}
+
+func advanceZeroKeyRecheck(
+	ctx context.Context,
+	tx pgx.Tx,
+	githubID int64,
+	login string,
+	ages []time.Duration,
+) error {
+	if len(ages) == 0 {
+		return nil
+	}
+	var stage int
+	err := tx.QueryRow(ctx, `
+		SELECT stage
+		FROM zero_key_rechecks
+		WHERE github_id = $1
+		FOR UPDATE
+	`, githubID).Scan(&stage)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stage >= len(ages)-1 {
+		_, err = tx.Exec(
+			ctx, `DELETE FROM zero_key_rechecks WHERE github_id = $1`, githubID,
+		)
+		return err
+	}
+	nextStage := stage + 1
+	_, err = tx.Exec(ctx, `
+		UPDATE zero_key_rechecks
+		SET stage = $2,
+		    login = CASE WHEN $3 = '' THEN login ELSE $3 END,
+		    last_checked_at = now(),
+		    next_scan_at = GREATEST(
+		      first_checked_at + $4::interval,
+		      now() + interval '5 minutes'
+		    )
+		WHERE github_id = $1
+	`, githubID, nextStage, login, pgInterval(ages[nextStage]))
 	return err
 }
 
@@ -706,6 +959,20 @@ func (s *Store) CompleteOverflow(
 	nextCursor string,
 	ownerRefresh time.Duration,
 ) error {
+	return s.CompleteOverflowScheduled(
+		ctx, job, keys, hasMore, nextCursor,
+		[]time.Duration{ownerRefresh},
+	)
+}
+
+func (s *Store) CompleteOverflowScheduled(
+	ctx context.Context,
+	job model.OverflowJob,
+	keys []model.PublicKey,
+	hasMore bool,
+	nextCursor string,
+	ownerSchedule []time.Duration,
+) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -726,7 +993,9 @@ func (s *Store) CompleteOverflow(
 			WHERE id = $1
 		`, job.ID, nextCursor)
 	} else {
-		if err = finalizeObservation(ctx, tx, job.GitHubID, job.ScanID, ownerRefresh); err == nil {
+		if err = finalizeObservation(
+			ctx, tx, job.GitHubID, job.ScanID, ownerSchedule,
+		); err == nil {
 			_, err = tx.Exec(ctx, `DELETE FROM overflow_queue WHERE id = $1`, job.ID)
 		}
 	}
@@ -791,7 +1060,7 @@ func (s *Store) MaybeCompleteMain(ctx context.Context) (bool, error) {
 }
 
 func (s *Store) Enqueue(ctx context.Context, source string, candidates []model.Candidate) (int64, error) {
-	if source != "tail" && source != "priority" {
+	if source != "tail" && source != "priority" && source != "onboarding" {
 		return 0, errors.New("invalid non-global queue source")
 	}
 	var inserted int64
@@ -808,6 +1077,26 @@ func (s *Store) Enqueue(ctx context.Context, source string, candidates []model.C
 		inserted += tag.RowsAffected()
 	}
 	return inserted, nil
+}
+
+func (s *Store) EnqueueDueZeroKeyRechecks(ctx context.Context, limit int) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		INSERT INTO account_queue (source, github_id, node_id, login)
+		SELECT 'onboarding', z.github_id, z.node_id, z.login
+		FROM zero_key_rechecks AS z
+		WHERE z.next_scan_at <= now()
+		  AND NOT EXISTS (
+		    SELECT 1 FROM account_queue AS q
+		    WHERE q.github_id = z.github_id
+		  )
+		ORDER BY z.next_scan_at, z.github_id
+		LIMIT $1
+		ON CONFLICT DO NOTHING
+	`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) EnqueueDueOwners(ctx context.Context, limit int) (int64, error) {
@@ -864,6 +1153,20 @@ func setStateTx(ctx context.Context, tx pgx.Tx, key, value string) error {
 		ON CONFLICT (key) DO UPDATE SET
 		  value = excluded.value, updated_at = now()
 	`, key, value)
+	return err
+}
+
+func setStateMaxIntTx(ctx context.Context, tx pgx.Tx, key string, value int64) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO runtime_state (key, value)
+		VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET
+		  value = GREATEST(
+		    runtime_state.value::bigint,
+		    excluded.value::bigint
+		  )::text,
+		  updated_at = now()
+	`, key, strconv.FormatInt(value, 10))
 	return err
 }
 
@@ -1019,6 +1322,19 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		  (SELECT COUNT(*) FROM overflow_queue)
 	`).Scan(&owners, &keys, &associations, &currentAssociations, &queued, &overflow)
 	if err != nil {
+		return nil, err
+	}
+	var zeroKeyRechecks, dueZeroKeyRechecks int64
+	var oldestDueZeroKeyAt *time.Time
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE next_scan_at <= now()),
+		  MIN(next_scan_at) FILTER (WHERE next_scan_at <= now())
+		FROM zero_key_rechecks
+	`).Scan(
+		&zeroKeyRechecks, &dueZeroKeyRechecks, &oldestDueZeroKeyAt,
+	); err != nil {
 		return nil, err
 	}
 	rows, err := s.Pool.Query(ctx, `
@@ -1182,6 +1498,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	}
 	highwater, _ := s.StateInt(ctx, "tail_highwater")
 	initialComplete, _ := s.State(ctx, "initial_complete")
+	liveTailInitialized, _ := s.State(ctx, "live_tail_initialized")
 	estimatedLow, _ := s.StateInt(ctx, "estimated_accounts_low")
 	estimatedHigh, _ := s.StateInt(ctx, "estimated_accounts_high")
 	if estimatedLow <= 0 {
@@ -1292,6 +1609,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			pacing[resource] = value
 		}
 	}
+	schedulerAllocation, _ := s.State(ctx, "scheduler_allocation")
+	ownerSchedule, _ := s.State(ctx, "owner_refresh_schedule")
+	zeroKeySchedule, _ := s.State(ctx, "zero_key_retry_ages")
 	return map[string]any{
 		"index": map[string]int64{
 			"owners": owners, "keys": keys, "associations": associations,
@@ -1299,11 +1619,18 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		},
 		"queue": map[string]any{
 			"accounts": queued, "overflow": overflow, "by_source_and_state": queueBreakdown,
+			"zero_key_rechecks": map[string]any{
+				"tracked":       zeroKeyRechecks,
+				"due":           dueZeroKeyRechecks,
+				"oldest_due_at": oldestDueZeroKeyAt,
+			},
 		},
 		"coverage": map[string]any{
-			"initial_complete": initialComplete == "true",
-			"tail_highwater":   highwater,
-			"scope":            "public GitHub SSH authentication keys observable through the API",
+			"initial_complete":      initialComplete == "true",
+			"live_tail_initialized": liveTailInitialized == "true",
+			"tail_highwater":        highwater,
+			"historical_retention":  "observed keys and account associations are retained permanently",
+			"scope":                 "public GitHub SSH authentication keys observable through the API",
 		},
 		"progress": progress,
 		"recovery": map[string]any{
@@ -1320,6 +1647,12 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			"latest_queue_error_at":  latestQueueErrorAt,
 		},
 		"pacing": pacing,
+		"scheduler": map[string]any{
+			"algorithm":              "weighted earliest-deadline-first",
+			"allocation":             schedulerAllocation,
+			"owner_refresh_schedule": ownerSchedule,
+			"zero_key_retry_ages":    zeroKeySchedule,
+		},
 		"crawler": map[string]any{
 			"online":            activeWorkers > 0,
 			"active_workers":    activeWorkers,

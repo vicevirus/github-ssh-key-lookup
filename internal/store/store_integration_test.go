@@ -31,8 +31,8 @@ func integrationStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	_, err = database.Pool.Exec(ctx, `
-		TRUNCATE crawler_workers, overflow_queue, account_queue, github_owner_keys,
-		         ssh_keys, github_owner_logins, github_owners,
+		TRUNCATE crawler_workers, overflow_queue, account_queue, zero_key_rechecks,
+		         github_owner_keys, ssh_keys, github_owner_logins, github_owners,
 		         crawl_runs, runtime_state RESTART IDENTITY CASCADE
 	`)
 	if err != nil {
@@ -366,6 +366,199 @@ func TestCompletedInitialRunStartsGlobalReconciliationAtZero(t *testing.T) {
 	}
 	if next.NextSinceID != 0 {
 		t.Fatalf("reconciliation did not restart at zero: %d", next.NextSinceID)
+	}
+}
+
+func TestParallelTailInitializationPreservesBackfillAndHighwater(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := database.InitializeLiveTail(
+		ctx, 1_000, "https://api.github.com/users?since=1000&per_page=100",
+	)
+	if err != nil || !created {
+		t.Fatalf("initialize live tail: created=%v err=%v", created, err)
+	}
+	active, err := database.ActiveMainRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CutoffUserID == nil || *active.CutoffUserID != 1_000 ||
+		active.NextSinceID != run.NextSinceID {
+		t.Fatalf("backfill checkpoint or cutoff changed incorrectly: %#v", active)
+	}
+	if err := database.ApplyTailPage(
+		ctx, nil, 1_025,
+		"https://api.github.com/users?since=1025&per_page=100", "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyEnumerationPage(
+		ctx, active, nil, 1_000,
+		"https://api.github.com/users?since=1000&per_page=100", true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	highwater, err := database.StateInt(ctx, "tail_highwater")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if highwater != 1_025 {
+		t.Fatalf("historical completion regressed live highwater to %d", highwater)
+	}
+	created, err = database.InitializeLiveTail(
+		ctx, 2_000, "https://api.github.com/users?since=2000&per_page=100",
+	)
+	if err != nil || created {
+		t.Fatalf("live tail initialization was not idempotent: created=%v err=%v", created, err)
+	}
+}
+
+func TestZeroKeyOnboardingLadderFindsAndRetainsLaterKey(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	ownerSchedule := []time.Duration{time.Hour, 2 * time.Hour}
+	recheckAges := []time.Duration{
+		time.Hour, 2 * time.Hour, 3 * time.Hour, 4 * time.Hour,
+	}
+	candidate := model.Candidate{
+		GitHubID: 501, NodeID: "U_501", Login: "late-key-owner",
+	}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 100, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteAccountsScheduled(
+		ctx, jobs, []*model.UserResult{{
+			NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+			Login: candidate.Login,
+		}}, ownerSchedule, recheckAges,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var stage int
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT stage FROM zero_key_rechecks WHERE github_id = $1
+	`, candidate.GitHubID).Scan(&stage); err != nil {
+		t.Fatal(err)
+	}
+	if stage != 0 {
+		t.Fatalf("initial zero-key stage = %d", stage)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE zero_key_rechecks SET next_scan_at = now() - interval '1 second'
+		WHERE github_id = $1
+	`, candidate.GitHubID); err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := database.EnqueueDueZeroKeyRechecks(ctx, 100); err != nil {
+		t.Fatal(err)
+	} else if inserted != 1 {
+		t.Fatalf("due zero-key jobs inserted = %d", inserted)
+	}
+	jobs, err = database.ClaimScheduledAccounts(ctx, 100, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Source != "onboarding" {
+		t.Fatalf("unexpected onboarding jobs: %#v", jobs)
+	}
+	key := parsedTestKey(t, 11)
+	if err := database.CompleteAccountsScheduled(
+		ctx, jobs, []*model.UserResult{{
+			NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+			Login: candidate.Login, Keys: []model.PublicKey{key},
+		}}, ownerSchedule, recheckAges,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var tracked int
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM zero_key_rechecks WHERE github_id = $1
+	`, candidate.GitHubID).Scan(&tracked); err != nil {
+		t.Fatal(err)
+	}
+	if tracked != 0 {
+		t.Fatalf("key owner remained in zero-key ladder: %d", tracked)
+	}
+
+	if _, err := database.Enqueue(ctx, "priority", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = database.ClaimScheduledAccounts(ctx, 100, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteAccountsScheduled(
+		ctx, jobs, []*model.UserResult{{
+			NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+			Login: candidate.Login,
+		}}, ownerSchedule, recheckAges,
+	); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := database.Lookup(ctx, key.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].CurrentlyPresent || matches[0].RemovedAt == nil {
+		t.Fatalf("deleted key was not retained historically: %#v", matches)
+	}
+}
+
+func TestAdaptiveOwnerRefreshResetsWhenKeySetChanges(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	schedule := []time.Duration{time.Hour, 2 * time.Hour, 3 * time.Hour}
+	candidate := model.Candidate{GitHubID: 601, NodeID: "U_601", Login: "adaptive"}
+	key := parsedTestKey(t, 12)
+	observe := func(keys []model.PublicKey) {
+		t.Helper()
+		if _, err := database.Enqueue(
+			ctx, "priority", []model.Candidate{candidate},
+		); err != nil {
+			t.Fatal(err)
+		}
+		jobs, err := database.ClaimScheduledAccounts(ctx, 100, "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.CompleteAccountsScheduled(
+			ctx, jobs, []*model.UserResult{{
+				NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+				Login: candidate.Login, Keys: keys,
+			}}, schedule, nil,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe([]model.PublicKey{key})
+	observe([]model.PublicKey{key})
+	var stage int
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT refresh_stage FROM github_owners WHERE github_id = $1
+	`, candidate.GitHubID).Scan(&stage); err != nil {
+		t.Fatal(err)
+	}
+	if stage != 1 {
+		t.Fatalf("stable owner did not back off: stage=%d", stage)
+	}
+	observe(nil)
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT refresh_stage FROM github_owners WHERE github_id = $1
+	`, candidate.GitHubID).Scan(&stage); err != nil {
+		t.Fatal(err)
+	}
+	if stage != 0 {
+		t.Fatalf("changed owner did not reset: stage=%d", stage)
 	}
 }
 

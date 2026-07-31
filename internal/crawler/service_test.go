@@ -40,3 +40,14 @@ func TestRetryDelayGrowsAndCaps(t *testing.T) {
 		t.Fatalf("rate limit wait ignored: %s", delay)
 	}
 }
+
+func TestWeightedSchedulerAllocation(t *testing.T) {
+	service := &Service{}
+	counts := map[string]int{}
+	for index := 0; index < 1_000; index++ {
+		counts[service.nextQueueClass()]++
+	}
+	if counts["global"] != 800 || counts["live"] != 100 || counts["owner"] != 100 {
+		t.Fatalf("unexpected weighted allocation: %#v", counts)
+	}
+}

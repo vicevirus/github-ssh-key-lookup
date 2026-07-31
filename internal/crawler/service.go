@@ -29,6 +29,8 @@ type Config struct {
 	GraphQLReserve        int
 	TailPollInterval      time.Duration
 	OwnerRefresh          time.Duration
+	OwnerSchedule         []time.Duration
+	ZeroKeyRecheckAges    []time.Duration
 	PriorityFillInterval  time.Duration
 	EstimatedAccountsLow  int64
 	EstimatedAccountsHigh int64
@@ -36,14 +38,29 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Workers:               4,
-		QueueMax:              10_000,
-		RESTPerHour:           4_700,
-		GraphQLPerHour:        3_600,
-		RESTReserve:           150,
-		GraphQLReserve:        200,
-		TailPollInterval:      time.Minute,
-		OwnerRefresh:          7 * 24 * time.Hour,
+		Workers:          4,
+		QueueMax:         10_000,
+		RESTPerHour:      4_700,
+		GraphQLPerHour:   3_600,
+		RESTReserve:      150,
+		GraphQLReserve:   200,
+		TailPollInterval: time.Minute,
+		OwnerRefresh:     7 * 24 * time.Hour,
+		OwnerSchedule: []time.Duration{
+			6 * time.Hour,
+			18 * time.Hour,
+			2 * 24 * time.Hour,
+			4 * 24 * time.Hour,
+			7 * 24 * time.Hour,
+			16 * 24 * time.Hour,
+			30 * 24 * time.Hour,
+		},
+		ZeroKeyRecheckAges: []time.Duration{
+			6 * time.Hour,
+			24 * time.Hour,
+			7 * 24 * time.Hour,
+			30 * 24 * time.Hour,
+		},
 		PriorityFillInterval:  10 * time.Second,
 		EstimatedAccountsLow:  190_000_000,
 		EstimatedAccountsHigh: 220_000_000,
@@ -57,6 +74,9 @@ type Service struct {
 	Logger  *slog.Logger
 	rest    *ratelimit.Pacer
 	graphql *ratelimit.Pacer
+
+	scheduleMu     sync.Mutex
+	scheduleCursor int
 }
 
 func New(database *store.Store, github *githubapi.Client, config Config, logger *slog.Logger) *Service {
@@ -78,6 +98,14 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	if config.EstimatedAccountsHigh < config.EstimatedAccountsLow {
 		config.EstimatedAccountsHigh = config.EstimatedAccountsLow
 	}
+	if len(config.OwnerSchedule) == 0 {
+		config.OwnerSchedule = []time.Duration{config.OwnerRefresh}
+	}
+	if len(config.ZeroKeyRecheckAges) == 0 {
+		config.ZeroKeyRecheckAges = []time.Duration{
+			6 * time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour,
+		}
+	}
 	return &Service{
 		Store: database, GitHub: github, Config: config, Logger: logger,
 		rest:    ratelimit.New(config.RESTPerHour, config.RESTReserve),
@@ -97,6 +125,9 @@ func (s *Service) Run(ctx context.Context) error {
 	for key, value := range map[string]string{
 		"estimated_accounts_low":  strconv.FormatInt(s.Config.EstimatedAccountsLow, 10),
 		"estimated_accounts_high": strconv.FormatInt(s.Config.EstimatedAccountsHigh, 10),
+		"scheduler_allocation":    "global=80%,live=10%,owner=10%; unused capacity is borrowed",
+		"owner_refresh_schedule":  durationList(s.Config.OwnerSchedule),
+		"zero_key_retry_ages":     durationList(s.Config.ZeroKeyRecheckAges),
 	} {
 		if err := s.Store.SetState(ctx, key, value); err != nil {
 			return err
@@ -119,11 +150,12 @@ func (s *Service) Run(ctx context.Context) error {
 	for worker := 0; worker < s.Config.Workers; worker++ {
 		workerID := worker
 		group.Go(func() error {
-			return s.keyWorker(groupCtx, workerID, workerID == 0)
+			return s.keyWorker(groupCtx, workerID)
 		})
 	}
 	group.Go(func() error { return s.tail(groupCtx) })
 	group.Go(func() error { return s.priorityOwners(groupCtx) })
+	group.Go(func() error { return s.zeroKeyRechecks(groupCtx) })
 	group.Go(func() error { return s.monitorRuns(groupCtx) })
 	return group.Wait()
 }
@@ -173,7 +205,12 @@ func (s *Service) enumerateMain(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if depth >= s.Config.QueueMax {
+		globalDepth, err := s.Store.QueueDepthByClass(ctx, "global")
+		if err != nil {
+			return err
+		}
+		globalQueueLimit := max(100, s.Config.QueueMax*8/10)
+		if depth >= s.Config.QueueMax || globalDepth >= globalQueueLimit {
 			if err := sleep(ctx, 500*time.Millisecond); err != nil {
 				return nil
 			}
@@ -241,7 +278,7 @@ func (s *Service) enumerateMain(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) keyWorker(ctx context.Context, workerID int, preferPriority bool) error {
+func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 	worker := fmt.Sprintf("graphql-%d", workerID)
 	role := "SSH key batch worker"
 	s.workerActivity(ctx, worker, role, "starting", "waiting for account batch")
@@ -257,7 +294,8 @@ func (s *Service) keyWorker(ctx context.Context, workerID int, preferPriority bo
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		jobs, err := s.Store.ClaimAccounts(ctx, 100, preferPriority)
+		preferredClass := s.nextQueueClass()
+		jobs, err := s.Store.ClaimScheduledAccounts(ctx, 100, preferredClass)
 		if err != nil {
 			return err
 		}
@@ -296,7 +334,10 @@ func (s *Service) keyWorker(ctx context.Context, workerID int, preferPriority bo
 			_ = sleep(ctx, retryDelay(err, maxJobAttempts(jobs)))
 			continue
 		}
-		if err := s.Store.CompleteAccounts(ctx, jobs, results, s.Config.OwnerRefresh); err != nil {
+		if err := s.Store.CompleteAccountsScheduled(
+			ctx, jobs, results,
+			s.Config.OwnerSchedule, s.Config.ZeroKeyRecheckAges,
+		); err != nil {
 			_ = s.Store.RequeueAccounts(context.Background(), jobs, err)
 			return err
 		}
@@ -316,6 +357,21 @@ func (s *Service) keyWorker(ctx context.Context, workerID int, preferPriority bo
 			"latency", response.Elapsed)
 	}
 	return nil
+}
+
+func (s *Service) nextQueueClass() string {
+	// Interleaving the slots avoids long bursts while preserving an 80/10/10
+	// request allocation. ClaimScheduledAccounts borrows from another class
+	// whenever the selected class cannot fill a batch.
+	slots := [...]string{
+		"global", "global", "global", "global", "live",
+		"global", "global", "global", "global", "owner",
+	}
+	s.scheduleMu.Lock()
+	class := slots[s.scheduleCursor%len(slots)]
+	s.scheduleCursor++
+	s.scheduleMu.Unlock()
+	return class
 }
 
 func (s *Service) processOverflow(ctx context.Context, workerID int, job model.OverflowJob) error {
@@ -351,9 +407,9 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 	s.workerRequest(
 		ctx, worker, role, "indexed overflow SSH key page", rate, 0, len(keys),
 	)
-	err = s.Store.CompleteOverflow(
+	err = s.Store.CompleteOverflowScheduled(
 		ctx, job, keys, user.PublicKeys.PageInfo.HasNextPage,
-		user.PublicKeys.PageInfo.EndCursor, s.Config.OwnerRefresh,
+		user.PublicKeys.PageInfo.EndCursor, s.Config.OwnerSchedule,
 	)
 	if err != nil {
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
@@ -412,16 +468,24 @@ func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {
 func (s *Service) tail(ctx context.Context) error {
 	const worker = "rest-tail"
 	const role = "new account tail"
-	s.workerActivity(ctx, worker, role, "starting", "waiting for initial enumeration")
+	s.workerActivity(ctx, worker, role, "starting", "initializing parallel live tail")
 	defer s.Store.StopWorker(context.Background(), worker, role)
+	if err := s.ensureLiveTail(ctx, worker, role); err != nil {
+		return err
+	}
 	failures := 0
 	for ctx.Err() == nil {
-		ready, err := s.Store.State(ctx, "initial_enumerated")
+		depth, err := s.Store.QueueDepth(ctx)
 		if err != nil {
 			return err
 		}
-		if ready != "true" {
-			if err := sleep(ctx, time.Second); err != nil {
+		liveDepth, err := s.Store.QueueDepthByClass(ctx, "live")
+		if err != nil {
+			return err
+		}
+		liveQueueLimit := max(100, s.Config.QueueMax/10)
+		if depth >= s.Config.QueueMax || liveDepth >= liveQueueLimit {
+			if err := sleep(ctx, 250*time.Millisecond); err != nil {
 				return nil
 			}
 			continue
@@ -499,10 +563,132 @@ func (s *Service) tail(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) ensureLiveTail(ctx context.Context, worker, role string) error {
+	initialized, err := s.Store.State(ctx, "live_tail_initialized")
+	if err != nil || initialized == "true" {
+		return err
+	}
+	legacyReady, err := s.Store.State(ctx, "initial_enumerated")
+	if err != nil {
+		return err
+	}
+	highwater, err := s.Store.StateInt(ctx, "tail_highwater")
+	if err != nil {
+		return err
+	}
+	if legacyReady == "true" && highwater > 0 {
+		requestURL, err := s.Store.State(ctx, "tail_url")
+		if err != nil {
+			return err
+		}
+		if requestURL == "" {
+			requestURL = s.GitHub.UsersURL(highwater)
+		}
+		_, err = s.Store.InitializeLiveTail(ctx, highwater, requestURL)
+		return err
+	}
+	run, err := s.Store.ActiveMainRun(ctx)
+	if err != nil {
+		return err
+	}
+	cutoff, err := s.discoverUserHighwater(ctx, worker, role, run.NextSinceID)
+	if err != nil {
+		return err
+	}
+	created, err := s.Store.InitializeLiveTail(
+		ctx, cutoff, s.GitHub.UsersURL(cutoff),
+	)
+	if err != nil {
+		return err
+	}
+	if created {
+		s.Logger.Info("initialized parallel live account tail", "cutoff", cutoff)
+		s.workerActivity(
+			ctx, worker, role, "running",
+			fmt.Sprintf("parallel live tail initialized at account ID %d", cutoff),
+		)
+	}
+	return nil
+}
+
+func (s *Service) discoverUserHighwater(
+	ctx context.Context,
+	worker string,
+	role string,
+	start int64,
+) (int64, error) {
+	probe := func(since int64) (bool, error) {
+		failures := 0
+		for {
+			if err := s.rest.Wait(ctx); err != nil {
+				return false, err
+			}
+			page, err := s.GitHub.ListUsers(ctx, s.GitHub.UsersURL(since), "")
+			if err == nil {
+				s.rest.Observe(page.Rate)
+				s.workerRequest(
+					ctx, worker, role,
+					fmt.Sprintf("probing live-tail boundary after ID %d", since),
+					page.Rate, 0, 0,
+				)
+				return len(page.Objects) > 0, nil
+			}
+			failures++
+			s.workerError(ctx, worker, role, "live-tail boundary probe failed", err)
+			if isAuthenticationError(err) {
+				return false, err
+			}
+			s.handleRateError(ctx, err, s.rest, "rest")
+			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
+				return false, err
+			}
+		}
+	}
+	low := max(int64(0), start)
+	hasAfterLow, err := probe(low)
+	if err != nil {
+		return 0, err
+	}
+	if !hasAfterLow {
+		return low, nil
+	}
+	high := max(int64(1), low*2)
+	if high <= low {
+		high = low + 1
+	}
+	for {
+		hasAfter, err := probe(high)
+		if err != nil {
+			return 0, err
+		}
+		if !hasAfter {
+			break
+		}
+		low = high
+		if high > (1<<62)-1 {
+			return 0, errors.New("GitHub account ID exceeds supported range")
+		}
+		high *= 2
+	}
+	for high-low > 1 {
+		middle := low + (high-low)/2
+		hasAfter, err := probe(middle)
+		if err != nil {
+			return 0, err
+		}
+		if hasAfter {
+			low = middle
+		} else {
+			high = middle
+		}
+	}
+	return high, nil
+}
+
 func (s *Service) priorityOwners(ctx context.Context) error {
 	const worker = "owner-refresh"
 	const role = "known key owner refresh scheduler"
-	s.workerActivity(ctx, worker, role, "starting", "waiting for initial scan completion")
+	s.workerActivity(ctx, worker, role, "starting", "scheduling adaptive owner refreshes")
 	defer s.Store.StopWorker(context.Background(), worker, role)
 	ticker := time.NewTicker(s.Config.PriorityFillInterval)
 	defer ticker.Stop()
@@ -511,21 +697,22 @@ func (s *Service) priorityOwners(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			ready, err := s.Store.State(ctx, "initial_complete")
-			if err != nil {
-				return err
-			}
-			if ready != "true" {
-				continue
-			}
 			depth, err := s.Store.QueueDepth(ctx)
 			if err != nil {
 				return err
 			}
-			if depth >= s.Config.QueueMax {
+			ownerDepth, err := s.Store.QueueDepthByClass(ctx, "owner")
+			if err != nil {
+				return err
+			}
+			ownerQueueLimit := max(100, s.Config.QueueMax/10)
+			if depth >= s.Config.QueueMax || ownerDepth >= ownerQueueLimit {
 				continue
 			}
-			limit := min(1_000, s.Config.QueueMax-depth)
+			limit := min(
+				ownerQueueLimit-ownerDepth,
+				s.Config.QueueMax-depth,
+			)
 			inserted, err := s.Store.EnqueueDueOwners(ctx, limit)
 			if err != nil {
 				s.workerError(ctx, worker, role, "failed to enqueue owner refresh", err)
@@ -534,6 +721,48 @@ func (s *Service) priorityOwners(ctx context.Context) error {
 			activity := "known-owner refresh queue is current"
 			if inserted > 0 {
 				activity = fmt.Sprintf("enqueued %d known owners for refresh", inserted)
+			}
+			s.workerActivity(ctx, worker, role, "waiting", activity)
+		}
+	}
+}
+
+func (s *Service) zeroKeyRechecks(ctx context.Context) error {
+	const worker = "zero-key-rechecks"
+	const role = "new zero-key account retry scheduler"
+	s.workerActivity(ctx, worker, role, "starting", "scheduling zero-key rechecks")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	ticker := time.NewTicker(s.Config.PriorityFillInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			depth, err := s.Store.QueueDepth(ctx)
+			if err != nil {
+				return err
+			}
+			liveDepth, err := s.Store.QueueDepthByClass(ctx, "live")
+			if err != nil {
+				return err
+			}
+			liveQueueLimit := max(100, s.Config.QueueMax/10)
+			if depth >= s.Config.QueueMax || liveDepth >= liveQueueLimit {
+				continue
+			}
+			limit := min(
+				liveQueueLimit-liveDepth,
+				s.Config.QueueMax-depth,
+			)
+			inserted, err := s.Store.EnqueueDueZeroKeyRechecks(ctx, limit)
+			if err != nil {
+				s.workerError(ctx, worker, role, "failed to enqueue zero-key rechecks", err)
+				return err
+			}
+			activity := "zero-key retry queue is current"
+			if inserted > 0 {
+				activity = fmt.Sprintf("enqueued %d zero-key accounts for recheck", inserted)
 			}
 			s.workerActivity(ctx, worker, role, "waiting", activity)
 		}
@@ -675,6 +904,14 @@ func sleep(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func durationList(values []time.Duration) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, value.String())
+	}
+	return strings.Join(parts, ",")
 }
 
 type cancelGroup struct {

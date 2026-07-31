@@ -66,6 +66,31 @@ CREATE TABLE IF NOT EXISTS account_queue (
 ALTER TABLE account_queue
 ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'account_queue'::regclass
+          AND conname = 'account_queue_source_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%onboarding%'
+    ) THEN
+        ALTER TABLE account_queue
+        DROP CONSTRAINT account_queue_source_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'account_queue'::regclass
+          AND conname = 'account_queue_source_check'
+    ) THEN
+        ALTER TABLE account_queue
+        ADD CONSTRAINT account_queue_source_check
+        CHECK (source IN ('global', 'tail', 'priority', 'onboarding'));
+    END IF;
+END
+$$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS account_queue_global_unique
 ON account_queue (run_id, github_id)
 WHERE source = 'global';
@@ -85,8 +110,16 @@ CREATE TABLE IF NOT EXISTS github_owners (
     last_seen_at TIMESTAMPTZ NOT NULL,
     last_verified_at TIMESTAMPTZ,
     next_priority_scan_at TIMESTAMPTZ,
+    refresh_stage SMALLINT NOT NULL DEFAULT 3,
+    last_changed_at TIMESTAMPTZ,
     inaccessible BOOLEAN NOT NULL DEFAULT false
 );
+
+ALTER TABLE github_owners
+ADD COLUMN IF NOT EXISTS refresh_stage SMALLINT NOT NULL DEFAULT 3;
+
+ALTER TABLE github_owners
+ADD COLUMN IF NOT EXISTS last_changed_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS github_owners_login_idx
 ON github_owners (lower(login));
@@ -119,11 +152,30 @@ CREATE TABLE IF NOT EXISTS github_owner_keys (
     currently_present BOOLEAN NOT NULL DEFAULT true,
     removed_at TIMESTAMPTZ,
     last_observation_scan UUID NOT NULL,
+    state_changed_scan UUID,
     PRIMARY KEY (github_id, fingerprint_sha256)
 );
 
+ALTER TABLE github_owner_keys
+ADD COLUMN IF NOT EXISTS state_changed_scan UUID;
+
 CREATE INDEX IF NOT EXISTS github_owner_keys_reverse_idx
 ON github_owner_keys (fingerprint_sha256, currently_present, github_id);
+
+CREATE TABLE IF NOT EXISTS zero_key_rechecks (
+    github_id BIGINT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    login TEXT NOT NULL,
+    stage SMALLINT NOT NULL DEFAULT 0,
+    first_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    next_scan_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    CHECK (stage BETWEEN 0 AND 3)
+);
+
+CREATE INDEX IF NOT EXISTS zero_key_rechecks_due_idx
+ON zero_key_rechecks (next_scan_at, github_id);
 
 CREATE TABLE IF NOT EXISTS overflow_queue (
     id BIGSERIAL PRIMARY KEY,
@@ -146,6 +198,31 @@ CREATE TABLE IF NOT EXISTS overflow_queue (
 
 ALTER TABLE overflow_queue
 ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'overflow_queue'::regclass
+          AND conname = 'overflow_queue_source_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%onboarding%'
+    ) THEN
+        ALTER TABLE overflow_queue
+        DROP CONSTRAINT overflow_queue_source_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'overflow_queue'::regclass
+          AND conname = 'overflow_queue_source_check'
+    ) THEN
+        ALTER TABLE overflow_queue
+        ADD CONSTRAINT overflow_queue_source_check
+        CHECK (source IN ('global', 'tail', 'priority', 'onboarding'));
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS overflow_queue_claim_idx
 ON overflow_queue (status, id);
