@@ -141,7 +141,22 @@ func (s *Service) Run(ctx context.Context) error {
 	s.workerActivity(ctx, "scheduler", "scheduler", "running", "crawler started")
 	defer s.Store.StopWorker(context.Background(), "scheduler", "scheduler")
 	group, groupCtx := withCancelGroup(ctx)
-	group.Go(func() error { return s.enumerateMain(groupCtx) })
+	activeRun, err := s.Store.ActiveMainRun(groupCtx)
+	if err != nil {
+		return err
+	}
+	sharded := activeRun.CutoffUserID != nil && !activeRun.EnumerationComplete
+	if sharded {
+		if err := s.Store.EnsureEnumerationShards(groupCtx, activeRun, s.Config.Workers, s.GitHub.UsersURL); err != nil {
+			return err
+		}
+		for worker := 0; worker < s.Config.Workers; worker++ {
+			workerID := worker
+			group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
+		}
+	} else {
+		group.Go(func() error { return s.enumerateMain(groupCtx) })
+	}
 
 	// Let REST build several full batches so the first GraphQL requests do not
 	// waste points on partially filled batches.
@@ -158,6 +173,76 @@ func (s *Service) Run(ctx context.Context) error {
 	group.Go(func() error { return s.zeroKeyRechecks(groupCtx) })
 	group.Go(func() error { return s.monitorRuns(groupCtx) })
 	return group.Wait()
+}
+
+func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error {
+	worker := fmt.Sprintf("rest-enumerator-%d", workerID)
+	role := "parallel global account enumeration"
+	s.workerActivity(ctx, worker, role, "running", "waiting for ID range")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	for ctx.Err() == nil {
+		run, err := s.Store.ActiveMainRun(ctx)
+		if err != nil {
+			return err
+		}
+		shard, err := s.Store.ClaimEnumerationShard(ctx, run.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if run.EnumerationComplete {
+				return nil
+			}
+			if err := sleep(ctx, 250*time.Millisecond); err != nil {
+				return nil
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for ctx.Err() == nil {
+			if err := s.rest.Wait(ctx); err != nil {
+				return nil
+			}
+			page, err := s.GitHub.ListUsers(ctx, shard.NextURL, "")
+			if err != nil {
+				s.workerError(ctx, worker, role, "REST shard request failed", err)
+				s.handleRateError(ctx, err, s.rest, "rest")
+				_ = s.Store.RequeueEnumerationShard(context.Background(), shard, err)
+				break
+			}
+			s.rest.Observe(page.Rate)
+			candidates := make([]model.Candidate, 0, len(page.Objects))
+			nextSince := shard.NextSinceID
+			reached := len(page.Objects) == 0 || page.NextURL == ""
+			for _, object := range page.Objects {
+				if object.ID > nextSince {
+					nextSince = object.ID
+				}
+				if object.ID > shard.UpperID {
+					reached = true
+					continue
+				}
+				if object.Type == "User" && object.NodeID != "" {
+					candidates = append(candidates, model.Candidate{GitHubID: object.ID, NodeID: object.NodeID, Login: object.Login})
+				}
+			}
+			if reached {
+				nextSince = shard.UpperID
+			}
+			nextURL := page.NextURL
+			if reached {
+				nextURL = s.GitHub.UsersURL(shard.UpperID)
+			}
+			if err := s.Store.ApplyEnumerationShardPage(ctx, shard, candidates, nextSince, nextURL, reached); err != nil {
+				return err
+			}
+			s.workerRequest(ctx, worker, role, "enumerated ID range", page.Rate, len(candidates), 0)
+			if reached {
+				break
+			}
+			shard.NextSinceID, shard.NextURL = nextSince, nextURL
+		}
+	}
+	return nil
 }
 
 func (s *Service) prefill(ctx context.Context) {

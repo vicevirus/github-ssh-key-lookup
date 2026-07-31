@@ -41,6 +41,17 @@ type Run struct {
 	CompletedAt         *time.Time `json:"completed_at,omitempty"`
 }
 
+type EnumerationShard struct {
+	ID              int64
+	RunID           int64
+	LowerID         int64
+	UpperID         int64
+	NextSinceID     int64
+	NextURL         string
+	Attempts        int
+	EnumeratedUsers int64
+}
+
 type Alias struct {
 	Login            string    `json:"login"`
 	FirstSeenAt      time.Time `json:"first_seen_at"`
@@ -183,6 +194,11 @@ func (s *Store) Recover(ctx context.Context) error {
 		    last_error_at = now()
 		WHERE status = 'running';
 		DELETE FROM crawler_workers;
+		UPDATE enumeration_shards
+		SET status = 'retry', claimed_at = NULL,
+		    last_error = COALESCE(last_error, 'recovered after restart'),
+		    last_error_at = now()
+		WHERE status = 'running';
 	`)
 	return err
 }
@@ -391,6 +407,115 @@ func (s *Store) ApplyEnumerationPage(
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) EnsureEnumerationShards(ctx context.Context, run Run, count int, urlFor func(int64) string) error {
+	if run.CutoffUserID == nil || *run.CutoffUserID <= run.NextSinceID || count < 2 {
+		return nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	span := (*run.CutoffUserID - run.NextSinceID) / int64(count)
+	if span < 1 {
+		span = 1
+	}
+	lower := run.NextSinceID
+	for index := 0; index < count && lower < *run.CutoffUserID; index++ {
+		upper := lower + span
+		if index == count-1 || upper > *run.CutoffUserID {
+			upper = *run.CutoffUserID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO enumeration_shards (run_id, lower_id, upper_id, next_since_id, next_url)
+			VALUES ($1, $2, $3, $2, $4) ON CONFLICT DO NOTHING
+		`, run.ID, lower, upper, urlFor(lower)); err != nil {
+			return err
+		}
+		lower = upper
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ClaimEnumerationShard(ctx context.Context, runID int64) (EnumerationShard, error) {
+	row := s.Pool.QueryRow(ctx, `
+		WITH picked AS (
+			SELECT id FROM enumeration_shards
+			WHERE run_id = $1 AND status IN ('pending','retry')
+			ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1
+		)
+		UPDATE enumeration_shards AS shard
+		SET status='running', attempts=attempts+1, claimed_at=now(), last_error=NULL
+		FROM picked WHERE shard.id=picked.id
+		RETURNING shard.id, shard.run_id, shard.lower_id, shard.upper_id,
+		          shard.next_since_id, shard.next_url, shard.attempts, shard.enumerated_users
+	`, runID)
+	var shard EnumerationShard
+	err := row.Scan(&shard.ID, &shard.RunID, &shard.LowerID, &shard.UpperID,
+		&shard.NextSinceID, &shard.NextURL, &shard.Attempts, &shard.EnumeratedUsers)
+	return shard, err
+}
+
+func (s *Store) ApplyEnumerationShardPage(ctx context.Context, shard EnumerationShard, candidates []model.Candidate, nextSince int64, nextURL string, complete bool) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var inserted int64
+	for _, candidate := range candidates {
+		result, err := tx.Exec(ctx, `
+			INSERT INTO account_queue (run_id, source, github_id, node_id, login)
+			VALUES ($1, 'global', $2, $3, $4) ON CONFLICT DO NOTHING
+		`, shard.RunID, candidate.GitHubID, candidate.NodeID, candidate.Login)
+		if err != nil {
+			return err
+		}
+		inserted += result.RowsAffected()
+	}
+	status := "running"
+	if complete {
+		status = "completed"
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE enumeration_shards
+		SET next_since_id=$2, next_url=$3, status=$4,
+		    enumerated_users=enumerated_users+$5,
+		    claimed_at=CASE WHEN $4='completed' THEN NULL ELSE claimed_at END,
+		    completed_at=CASE WHEN $4='completed' THEN now() ELSE completed_at END
+		WHERE id=$1
+	`, shard.ID, nextSince, nextURL, status, inserted)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE crawl_runs SET next_since_id=GREATEST(next_since_id,$2), enumerated_users=enumerated_users+$3,
+			enumeration_complete=CASE WHEN NOT EXISTS (
+				SELECT 1 FROM enumeration_shards WHERE run_id=$1 AND status <> 'completed'
+			) THEN true ELSE enumeration_complete END
+		WHERE id=$1
+	`, shard.RunID, nextSince, inserted)
+	if err != nil {
+		return err
+	}
+	if complete {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO runtime_state (key, value) SELECT 'initial_enumerated', 'true'
+			WHERE NOT EXISTS (SELECT 1 FROM enumeration_shards WHERE run_id=$1 AND status <> 'completed')
+			ON CONFLICT (key) DO UPDATE SET value=excluded.value, updated_at=now()
+		`, shard.RunID)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) RequeueEnumerationShard(ctx context.Context, shard EnumerationShard, cause error) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE enumeration_shards SET status='retry', claimed_at=NULL, last_error=$2, last_error_at=now() WHERE id=$1`, shard.ID, cause.Error())
+	return err
 }
 
 func (s *Store) QueueDepth(ctx context.Context) (int, error) {
