@@ -54,7 +54,7 @@ func TestWeightedSchedulerAllocation(t *testing.T) {
 
 func TestNormalizeKeysSkipsMalformedKeyWithoutPoisoningBatch(t *testing.T) {
 	keys, invalid := normalizeKeys([]githubapi.GraphQLKey{
-		{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAAJAsokcuriAAABAAABAQ"},
+		{Key: "ssh-rsa not-valid-base64"},
 		{Key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"},
 	})
 	if invalid != 1 {

@@ -81,3 +81,32 @@ func TestParseRejectsMultipleKeys(t *testing.T) {
 		t.Fatal("accepted multiple public keys")
 	}
 }
+
+func TestParseRFC4253RSAWithLargeExponent(t *testing.T) {
+	const unusualRSA = "ssh-rsa AAAAB3NzaC1yc2EAAAAJAsokcuriAAABAAABAQDhas4u48SN8004rJFz2w8W3VVABgV0kMLJqRq6vj5p+q1tFxXJFt/E1hRl5vpFPUqPh7uZ1nnYHkfM9sDmKCrq9r9KyX+i1+DaEHabP4QsXt2W/5fcxHswJHWReTRa7dA4wHo9iFW27rMHk32OSAvIy3y8bTSuD8PFeuhjTouONHNFwEaJudX3FuqGy7ZQzF6yrf5WrYYrZpQXPyiGjv8E3b9wr2HeT9mr1R8rPukKV23dLRfLERXXdbzK8Wcw0AcDmMXWGhnaC2q7fwoUEq6XO+ArHmaV0OmCrb3R2pW1tXY3VrwXpSxXMd4lrrrRd6sKroHZmQOfMCWfdgBx62KT"
+	key, err := Parse(unusualRSA + " vanity-comment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.Type != "ssh-rsa" {
+		t.Fatalf("type = %q", key.Type)
+	}
+	if key.Text != "SHA256:cifKeaoLTezpRRdYtMNnPURa3L//wT4gS3pC0S7KSB0" {
+		t.Fatalf("fingerprint = %q", key.Text)
+	}
+	if key.Canonical != unusualRSA {
+		t.Fatalf("canonical key changed: %q", key.Canonical)
+	}
+}
+
+func TestRFC4253RSAFallbackRejectsBrokenFraming(t *testing.T) {
+	for _, key := range []string{
+		"ssh-rsa not-valid-base64",
+		"ssh-rsa AAAAB3NzaC1yc2EAAAAJAsokcuriAAABAAABAQ",
+		"ssh-ed25519 AAAAB3NzaC1yc2EAAAAJAsokcuriAAABAAABAQ",
+	} {
+		if _, err := Parse(key); err == nil {
+			t.Fatalf("accepted broken key %q", key)
+		}
+	}
+}
