@@ -342,9 +342,16 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			return err
 		}
 		keyCount := 0
+		invalidKeyCount := 0
 		for _, result := range results {
 			if result != nil {
 				keyCount += len(result.Keys)
+				invalidKeyCount += result.InvalidKeys
+				if result.InvalidKeys > 0 {
+					s.Logger.Warn("skipped malformed GitHub public key",
+						"login", result.Login, "github_id", result.GitHubID,
+						"count", result.InvalidKeys)
+				}
 			}
 		}
 		s.workerRequest(
@@ -353,6 +360,7 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		)
 		s.Logger.Info("indexed GraphQL batch",
 			"worker", workerID, "users", len(jobs), "keys", keyCount,
+			"invalid_keys", invalidKeyCount,
 			"cost", response.Rate.Cost, "remaining", response.Rate.Remaining,
 			"latency", response.Elapsed)
 	}
@@ -399,10 +407,11 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		return nil
 	}
-	keys, err := normalizeKeys(user.PublicKeys.Nodes)
-	if err != nil {
-		_ = s.Store.RequeueOverflow(context.Background(), job, err)
-		return nil
+	keys, invalidKeys := normalizeKeys(user.PublicKeys.Nodes)
+	if invalidKeys > 0 {
+		s.Logger.Warn("skipped malformed GitHub overflow public key",
+			"login", user.Login, "github_id", job.GitHubID,
+			"count", invalidKeys)
 	}
 	s.workerRequest(
 		ctx, worker, role, "indexed overflow SSH key page", rate, 0, len(keys),
@@ -436,33 +445,34 @@ func normalizeUsers(jobs []model.Candidate, nodes []*githubapi.GraphQLUser) ([]*
 				jobs[index].GitHubID, user.DatabaseID,
 			)
 		}
-		keys, err := normalizeKeys(user.PublicKeys.Nodes)
-		if err != nil {
-			return nil, fmt.Errorf("user %s: %w", user.Login, err)
-		}
+		keys, invalidKeys := normalizeKeys(user.PublicKeys.Nodes)
 		results[index] = &model.UserResult{
 			NodeID: user.ID, GitHubID: jobs[index].GitHubID, Login: user.Login,
 			Keys: keys, HasMoreKeys: user.PublicKeys.PageInfo.HasNextPage,
 			NextCursor:    user.PublicKeys.PageInfo.EndCursor,
 			TotalKeyCount: user.PublicKeys.TotalCount,
+			InvalidKeys:   invalidKeys,
 		}
 	}
 	return results, nil
 }
 
-func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {
+func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, int) {
 	result := make([]model.PublicKey, 0, len(keys))
+	invalid := 0
 	for _, raw := range keys {
 		key, err := sshkey.Parse(raw.Key)
 		if err != nil {
-			return nil, err
+			invalid++
+			continue
 		}
 		if strings.HasPrefix(raw.Fingerprint, "SHA256:") && raw.Fingerprint != key.Text {
-			return nil, fmt.Errorf("reported fingerprint %s does not match calculated %s", raw.Fingerprint, key.Text)
+			invalid++
+			continue
 		}
 		result = append(result, key)
 	}
-	return result, nil
+	return result, invalid
 }
 
 func (s *Service) tail(ctx context.Context) error {

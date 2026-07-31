@@ -51,3 +51,16 @@ func TestWeightedSchedulerAllocation(t *testing.T) {
 		t.Fatalf("unexpected weighted allocation: %#v", counts)
 	}
 }
+
+func TestNormalizeKeysSkipsMalformedKeyWithoutPoisoningBatch(t *testing.T) {
+	keys, invalid := normalizeKeys([]githubapi.GraphQLKey{
+		{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAAJAsokcuriAAABAAABAQ"},
+		{Key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"},
+	})
+	if invalid != 1 {
+		t.Fatalf("invalid key count = %d", invalid)
+	}
+	if len(keys) != 1 || keys[0].Type != "ssh-ed25519" {
+		t.Fatalf("valid key was lost with malformed neighbor: %#v", keys)
+	}
+}

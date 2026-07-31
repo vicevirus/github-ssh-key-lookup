@@ -28,6 +28,7 @@ type UserResult struct {
 	HasMoreKeys   bool
 	NextCursor    string
 	TotalKeyCount int
+	InvalidKeys   int
 }
 
 type OverflowJob struct {
