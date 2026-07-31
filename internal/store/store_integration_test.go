@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -416,6 +417,41 @@ func TestParallelTailInitializationPreservesBackfillAndHighwater(t *testing.T) {
 	)
 	if err != nil || created {
 		t.Fatalf("live tail initialization was not idempotent: created=%v err=%v", created, err)
+	}
+}
+
+func TestEnumerationShardsAreNotDuplicatedAfterRestart(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoff := int64(1_000)
+	run.CutoffUserID = &cutoff
+	run.NextSinceID = 0
+	urlFor := func(since int64) string {
+		return "https://api.github.com/users?since=" + strconv.FormatInt(since, 10)
+	}
+	if err := database.EnsureEnumerationShards(ctx, run, 4, urlFor); err != nil {
+		t.Fatal(err)
+	}
+	// A restarted process sees a later moving run checkpoint but must reuse
+	// the durable shard set instead of creating overlapping ranges.
+	run.NextSinceID = 250
+	if err := database.EnsureEnumerationShards(ctx, run, 4, urlFor); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM enumeration_shards WHERE run_id = $1
+	`, run.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("restart created duplicate shard set: %d shards", count)
 	}
 }
 

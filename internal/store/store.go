@@ -418,6 +418,19 @@ func (s *Store) EnsureEnumerationShards(ctx context.Context, run Run, count int,
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Shards are durable work units. On a crawler restart the active run is
+	// loaded again, so do not create a second set from the moving run
+	// checkpoint. The old implementation could create overlapping ranges
+	// after one shard had advanced run.next_since_id, wasting REST quota.
+	var existing int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM enumeration_shards WHERE run_id = $1
+	`, run.ID).Scan(&existing); err != nil {
+		return err
+	}
+	if existing > 0 {
+		return tx.Commit(ctx)
+	}
 	span := (*run.CutoffUserID - run.NextSinceID) / int64(count)
 	if span < 1 {
 		span = 1
@@ -1485,6 +1498,58 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	rows.Close()
+	shardStatus := map[string]any{
+		"count":     0,
+		"completed": 0,
+		"remaining": 0,
+		"ranges":    []map[string]any{},
+	}
+	if len(runs) > 0 {
+		shardRows, err := s.Pool.Query(ctx, `
+			SELECT id, lower_id, upper_id, next_since_id, status,
+			       enumerated_users, attempts
+			FROM enumeration_shards
+			WHERE run_id = $1
+			ORDER BY lower_id, id
+		`, runs[0].ID)
+		if err != nil {
+			return nil, err
+		}
+		var ranges []map[string]any
+		completed := 0
+		remaining := 0
+		for shardRows.Next() {
+			var id, lowerID, upperID, nextSince, enumerated int64
+			var status string
+			var attempts int
+			if err := shardRows.Scan(
+				&id, &lowerID, &upperID, &nextSince, &status,
+				&enumerated, &attempts,
+			); err != nil {
+				shardRows.Close()
+				return nil, err
+			}
+			if status == "completed" {
+				completed++
+			} else {
+				remaining++
+			}
+			ranges = append(ranges, map[string]any{
+				"id": id, "lower_id": lowerID, "upper_id": upperID,
+				"next_since_id": nextSince, "status": status,
+				"enumerated_users": enumerated, "attempts": attempts,
+			})
+		}
+		if err := shardRows.Err(); err != nil {
+			shardRows.Close()
+			return nil, err
+		}
+		shardRows.Close()
+		shardStatus = map[string]any{
+			"count": len(ranges), "completed": completed,
+			"remaining": remaining, "ranges": ranges,
+		}
+	}
 	queueRows, err := s.Pool.Query(ctx, `
 		SELECT source, status, COUNT(*)
 		FROM account_queue
@@ -1758,6 +1823,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			"scope":                 "public GitHub SSH authentication keys observable through the API",
 		},
 		"progress": progress,
+		"enumeration": map[string]any{
+			"checkpoint_meaning": "furthest parallel shard position; inspect ranges for contiguous coverage",
+			"shards":             shardStatus,
+		},
 		"recovery": map[string]any{
 			"state":                  recoveryState,
 			"message":                recoveryMessage,
