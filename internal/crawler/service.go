@@ -141,21 +141,12 @@ func (s *Service) Run(ctx context.Context) error {
 	s.workerActivity(ctx, "scheduler", "scheduler", "running", "crawler started")
 	defer s.Store.StopWorker(context.Background(), "scheduler", "scheduler")
 	group, groupCtx := withCancelGroup(ctx)
-	activeRun, err := s.Store.ActiveMainRun(groupCtx)
-	if err != nil {
-		return err
-	}
-	sharded := activeRun.CutoffUserID != nil && !activeRun.EnumerationComplete
-	if sharded {
-		if err := s.Store.EnsureEnumerationShards(groupCtx, activeRun, s.Config.Workers, s.GitHub.UsersURL); err != nil {
-			return err
-		}
-		for worker := 0; worker < s.Config.Workers; worker++ {
-			workerID := worker
-			group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
-		}
-	} else {
-		group.Go(func() error { return s.enumerateMain(groupCtx) })
+	// Enumeration workers are permanent. They wait while a run drains and then
+	// initialize and process the next reconciliation run without requiring a
+	// crawler restart.
+	for worker := 0; worker < s.Config.Workers; worker++ {
+		workerID := worker
+		group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
 	}
 
 	// Let REST build several full batches so the first GraphQL requests do not
@@ -182,14 +173,29 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 	defer s.Store.StopWorker(context.Background(), worker, role)
 	for ctx.Err() == nil {
 		run, err := s.Store.ActiveMainRun(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := sleep(ctx, 250*time.Millisecond); err != nil {
+				return nil
+			}
+			continue
+		}
 		if err != nil {
+			return err
+		}
+		if run.EnumerationComplete || run.CutoffUserID == nil {
+			s.workerActivity(ctx, worker, role, "waiting", "waiting for next ID range")
+			if err := sleep(ctx, 250*time.Millisecond); err != nil {
+				return nil
+			}
+			continue
+		}
+		if err := s.Store.EnsureEnumerationShards(
+			ctx, run, s.Config.Workers, s.GitHub.UsersURL,
+		); err != nil {
 			return err
 		}
 		shard, err := s.Store.ClaimEnumerationShard(ctx, run.ID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			if run.EnumerationComplete {
-				return nil
-			}
 			if err := sleep(ctx, 250*time.Millisecond); err != nil {
 				return nil
 			}

@@ -63,6 +63,25 @@ func parsedTestKey(t *testing.T, offset byte) model.PublicKey {
 	return key
 }
 
+func TestRepeatedMigrationDoesNotLockLiveQueueTables(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	tx, err := database.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `LOCK TABLE account_queue IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateContext, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := database.Migrate(migrateContext); err != nil {
+		t.Fatalf("repeat migration touched a live queue table: %v", err)
+	}
+}
+
 func TestZeroKeyUserIsDiscardedThenDiscoveredOnLaterPass(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
