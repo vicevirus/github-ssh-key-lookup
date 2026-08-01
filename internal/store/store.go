@@ -354,6 +354,26 @@ func scanRun(row rowScanner) (Run, error) {
 	return run, err
 }
 
+func lockCrawlRuns(ctx context.Context, tx pgx.Tx, runIDs []int64) error {
+	if len(runIDs) == 0 {
+		return nil
+	}
+	unique := make(map[int64]struct{}, len(runIDs))
+	ordered := make([]int64, 0, len(runIDs))
+	for _, runID := range runIDs {
+		if _, exists := unique[runID]; exists {
+			continue
+		}
+		unique[runID] = struct{}{}
+		ordered = append(ordered, runID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	_, err := tx.Exec(ctx, `
+		SELECT id FROM crawl_runs WHERE id = ANY($1) ORDER BY id FOR UPDATE
+	`, ordered)
+	return err
+}
+
 func (s *Store) ApplyEnumerationPage(
 	ctx context.Context,
 	run Run,
@@ -367,6 +387,9 @@ func (s *Store) ApplyEnumerationPage(
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockCrawlRuns(ctx, tx, []int64{run.ID}); err != nil {
+		return err
+	}
 	inserted := int64(0)
 	for _, candidate := range candidates {
 		result, err := tx.Exec(ctx, `
@@ -477,6 +500,9 @@ func (s *Store) ApplyEnumerationShardPage(ctx context.Context, shard Enumeration
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockCrawlRuns(ctx, tx, []int64{shard.RunID}); err != nil {
+		return err
+	}
 	var inserted int64
 	for _, candidate := range candidates {
 		result, err := tx.Exec(ctx, `
@@ -751,6 +777,15 @@ func (s *Store) CompleteAccountsScheduled(
 		return err
 	}
 	defer tx.Rollback(ctx)
+	runIDs := make([]int64, 0, len(jobs))
+	for _, job := range jobs {
+		if job.RunID != nil {
+			runIDs = append(runIDs, *job.RunID)
+		}
+	}
+	if err := lockCrawlRuns(ctx, tx, runIDs); err != nil {
+		return err
+	}
 	for index, job := range jobs {
 		result := results[index]
 		if result == nil {
