@@ -25,7 +25,14 @@ type Server struct {
 	Store  *store.Store
 	Logger *slog.Logger
 	limit  *ipLimiter
+
+	statusMu       sync.Mutex
+	statusRefresh  sync.Mutex
+	statusSnapshot map[string]any
+	statusFetched  time.Time
 }
+
+const statusCacheTTL = 30 * time.Second
 
 func New(database *store.Store, logger *slog.Logger) *Server {
 	if logger == nil {
@@ -81,12 +88,65 @@ func (s *Server) health(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) status(response http.ResponseWriter, request *http.Request) {
-	status, err := s.Store.Status(request.Context())
+	// Status performs several full-table counts and is intentionally cached so
+	// polling dashboards cannot compete with the crawler for PostgreSQL I/O.
+	// Serialize refreshes to avoid a thundering herd when the cache expires.
+	s.statusRefresh.Lock()
+	defer s.statusRefresh.Unlock()
+
+	now := time.Now()
+	s.statusMu.Lock()
+	snapshot, fetched := s.statusSnapshot, s.statusFetched
+	s.statusMu.Unlock()
+	if snapshot != nil && now.Sub(fetched) < statusCacheTTL {
+		s.writeStatusSnapshot(response, snapshot, fetched, false)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), 20*time.Second)
+	defer cancel()
+	fresh, err := s.Store.Status(ctx)
 	if err != nil {
+		// A recent snapshot is more useful than turning a temporary database
+		// slowdown into a blank status page. Healthz remains the liveness signal.
+		if snapshot != nil {
+			s.writeStatusSnapshot(response, snapshot, fetched, true)
+			return
+		}
 		s.internalError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, status)
+	s.statusMu.Lock()
+	s.statusSnapshot = fresh
+	s.statusFetched = time.Now()
+	fetched = s.statusFetched
+	s.statusMu.Unlock()
+	s.writeStatusSnapshot(response, fresh, fetched, false)
+}
+
+func (s *Server) writeStatusSnapshot(
+	response http.ResponseWriter,
+	snapshot map[string]any,
+	fetched time.Time,
+	stale bool,
+) {
+	body := make(map[string]any, len(snapshot)+1)
+	for key, value := range snapshot {
+		body[key] = value
+	}
+	age := time.Since(fetched)
+	if age < 0 {
+		age = 0
+	}
+	body["status_cache"] = map[string]any{
+		"fetched_at":  fetched.UTC().Format(time.RFC3339Nano),
+		"age_seconds": age.Seconds(),
+		"ttl_seconds": statusCacheTTL.Seconds(),
+		"stale":       stale || age >= statusCacheTTL,
+	}
+	response.Header().Set("Cache-Control", "public, max-age=30")
+	response.Header().Set("X-Status-Snapshot-At", fetched.UTC().Format(time.RFC3339Nano))
+	writeJSON(response, http.StatusOK, body)
 }
 
 func (s *Server) users(response http.ResponseWriter, request *http.Request) {
