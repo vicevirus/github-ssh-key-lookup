@@ -241,6 +241,22 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 			if err := s.Store.ApplyEnumerationShardPage(ctx, shard, candidates, nextSince, nextURL, reached); err != nil {
 				return err
 			}
+			if !reached {
+				previousUpper := shard.UpperID
+				newUpper, err := s.Store.RebalanceOwnedEnumerationShard(
+					ctx, shard, s.Config.Workers, s.GitHub.UsersURL,
+				)
+				if err != nil {
+					return err
+				}
+				shard.UpperID = newUpper
+				if newUpper != previousUpper {
+					s.Logger.Info("split remaining enumeration range",
+						"worker", workerID, "shard", shard.ID,
+						"next_since", nextSince, "old_upper", previousUpper,
+						"new_upper", newUpper)
+				}
+			}
 			s.workerRequest(ctx, worker, role, "enumerated ID range", page.Rate, len(candidates), 0)
 			if reached {
 				break

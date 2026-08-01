@@ -641,6 +641,84 @@ func (s *Store) ApplyEnumerationShardPage(ctx context.Context, shard Enumeration
 	return tx.Commit(ctx)
 }
 
+// RebalanceOwnedEnumerationShard splits the unprocessed suffix of a shard
+// owned by the caller when fewer than desired shards remain available. Only
+// the owning worker calls this between pages, so changing its upper boundary
+// cannot race with an in-flight request using the old boundary.
+func (s *Store) RebalanceOwnedEnumerationShard(
+	ctx context.Context,
+	shard EnumerationShard,
+	desired int,
+	urlFor func(int64) string,
+) (int64, error) {
+	if desired < 2 {
+		return shard.UpperID, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return shard.UpperID, err
+	}
+	defer tx.Rollback(ctx)
+
+	var nextSince, originalUpper int64
+	var status string
+	if err := tx.QueryRow(ctx, `
+		SELECT next_since_id, upper_id, status
+		FROM enumeration_shards
+		WHERE id = $1 AND run_id = $2
+		FOR UPDATE
+	`, shard.ID, shard.RunID).Scan(&nextSince, &originalUpper, &status); err != nil {
+		return shard.UpperID, err
+	}
+	if status != "running" {
+		return originalUpper, tx.Commit(ctx)
+	}
+
+	var active int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM enumeration_shards
+		WHERE run_id = $1 AND status <> 'completed'
+	`, shard.RunID).Scan(&active); err != nil {
+		return originalUpper, err
+	}
+	missing := desired - active
+	if missing <= 0 {
+		return originalUpper, tx.Commit(ctx)
+	}
+	pieces := missing + 1
+	remaining := originalUpper - nextSince
+	// Avoid creating ranges smaller than one full REST page worth of IDs.
+	if remaining < int64(pieces*100) {
+		return originalUpper, tx.Commit(ctx)
+	}
+	step := remaining / int64(pieces)
+	newUpper := nextSince + step
+	if _, err := tx.Exec(ctx, `
+		UPDATE enumeration_shards SET upper_id = $2 WHERE id = $1
+	`, shard.ID, newUpper); err != nil {
+		return originalUpper, err
+	}
+	for part := 1; part < pieces; part++ {
+		lower := nextSince + step*int64(part)
+		upper := nextSince + step*int64(part+1)
+		if part == pieces-1 {
+			upper = originalUpper
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO enumeration_shards (
+			  run_id, lower_id, upper_id, next_since_id, next_url
+			) VALUES ($1, $2, $3, $2, $4)
+		`, shard.RunID, lower, upper, urlFor(lower)); err != nil {
+			return originalUpper, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return originalUpper, err
+	}
+	return newUpper, nil
+}
+
 func (s *Store) RequeueEnumerationShard(ctx context.Context, shard EnumerationShard, cause error) error {
 	_, err := s.Pool.Exec(ctx, `UPDATE enumeration_shards SET status='retry', claimed_at=NULL, last_error=$2, last_error_at=now() WHERE id=$1`, shard.ID, cause.Error())
 	return err
