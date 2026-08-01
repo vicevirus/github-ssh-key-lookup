@@ -123,6 +123,12 @@ WHERE source <> 'global';
 CREATE INDEX IF NOT EXISTS account_queue_claim_idx
 ON account_queue (status, source, id);
 
+-- Queue workers only claim pending/retry rows. This partial index prevents
+-- batch selection from sorting the entire historical queue backlog.
+CREATE INDEX IF NOT EXISTS account_queue_ready_source_idx
+ON account_queue (source, id)
+WHERE status IN ('pending', 'retry');
+
 CREATE TABLE IF NOT EXISTS github_owners (
     github_id BIGINT PRIMARY KEY,
     node_id TEXT NOT NULL UNIQUE,
