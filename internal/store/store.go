@@ -565,26 +565,56 @@ func (s *Store) ClaimScheduledAccounts(
 	limit int,
 	preferred string,
 ) ([]model.Candidate, error) {
-	rows, err := s.Pool.Query(ctx, `
+	preferredSources := []string{"global"}
+	switch preferred {
+	case "live":
+		preferredSources = []string{"tail", "onboarding"}
+	case "owner":
+		preferredSources = []string{"priority"}
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	result, err := claimAccountSources(ctx, tx, limit, preferredSources, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) < limit {
+		fallback, err := claimAccountSources(
+			ctx, tx, limit-len(result), preferredSources, true,
+		)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, fallback...)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].QueueID < result[j].QueueID })
+	return result, nil
+}
+
+func claimAccountSources(
+	ctx context.Context,
+	tx pgx.Tx,
+	limit int,
+	sources []string,
+	exclude bool,
+) ([]model.Candidate, error) {
+	condition := "source = ANY($2::text[])"
+	if exclude {
+		condition = "NOT (source = ANY($2::text[]))"
+	}
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
 		WITH picked AS (
 		  SELECT id
 		  FROM account_queue
 		  WHERE status IN ('pending', 'retry')
-		  ORDER BY
-		    CASE
-		      WHEN $2 = 'global' AND source = 'global' THEN 0
-		      WHEN $2 = 'live' AND source IN ('tail', 'onboarding') THEN 0
-		      WHEN $2 = 'owner' AND source = 'priority' THEN 0
-		      ELSE 1
-		    END,
-		    CASE source
-		      WHEN 'tail' THEN 0
-		      WHEN 'onboarding' THEN 1
-		      WHEN 'priority' THEN 2
-		      WHEN 'global' THEN 3
-		      ELSE 4
-		    END,
-		    id
+		    AND %s
+		  ORDER BY id
 		  FOR UPDATE SKIP LOCKED
 		  LIMIT $1
 		)
@@ -595,7 +625,7 @@ func (s *Store) ClaimScheduledAccounts(
 		WHERE q.id = picked.id
 		RETURNING q.id, q.run_id, q.source, q.github_id,
 		          q.node_id, q.login, q.scan_id::text, q.attempts
-	`, limit, preferred)
+	`, condition), limit, sources)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +641,6 @@ func (s *Store) ClaimScheduledAccounts(
 		}
 		result = append(result, item)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].QueueID < result[j].QueueID })
 	return result, rows.Err()
 }
 
