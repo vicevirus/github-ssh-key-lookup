@@ -150,8 +150,9 @@ func (s *Store) Close() {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	sql, err := migrations.ReadFile("migrations/001_init.sql")
-	if err != nil {
+	const version = "001_init_20260802"
+	applied, err := s.migrationApplied(ctx, version)
+	if err != nil || applied {
 		return err
 	}
 
@@ -175,10 +176,98 @@ func (s *Store) Migrate(ctx context.Context) error {
 		)
 	}()
 
-	if _, err := connection.Exec(ctx, string(sql)); err != nil {
-		return fmt.Errorf("apply database migration: %w", err)
+	// Another process may have completed the migration while this process was
+	// waiting for the advisory lock.
+	applied, err = migrationAppliedOn(ctx, connection, version)
+	if err != nil || applied {
+		return err
+	}
+
+	ready, err := currentSchemaReady(ctx, connection)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		sql, err := migrations.ReadFile("migrations/001_init.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := connection.Exec(ctx, string(sql)); err != nil {
+			return fmt.Errorf("apply database migration: %w", err)
+		}
+	}
+	if _, err := connection.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+		  version TEXT PRIMARY KEY,
+		  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
+	}
+	if _, err := connection.Exec(ctx, `
+		INSERT INTO schema_migrations (version) VALUES ($1)
+		ON CONFLICT (version) DO NOTHING
+	`, version); err != nil {
+		return fmt.Errorf("record database migration: %w", err)
 	}
 	return nil
+}
+
+type migrationQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func (s *Store) migrationApplied(ctx context.Context, version string) (bool, error) {
+	return migrationAppliedOn(ctx, s.Pool, version)
+}
+
+func migrationAppliedOn(ctx context.Context, database migrationQuerier, version string) (bool, error) {
+	var tableExists bool
+	if err := database.QueryRow(ctx, `
+		SELECT to_regclass('public.schema_migrations') IS NOT NULL
+	`).Scan(&tableExists); err != nil || !tableExists {
+		return false, err
+	}
+	var applied bool
+	err := database.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)
+	`, version).Scan(&applied)
+	return applied, err
+}
+
+func currentSchemaReady(ctx context.Context, database migrationQuerier) (bool, error) {
+	var ready bool
+	err := database.QueryRow(ctx, `
+		SELECT
+		  to_regclass('public.runtime_state') IS NOT NULL AND
+		  to_regclass('public.crawler_workers') IS NOT NULL AND
+		  to_regclass('public.crawl_runs') IS NOT NULL AND
+		  to_regclass('public.enumeration_shards') IS NOT NULL AND
+		  to_regclass('public.account_queue') IS NOT NULL AND
+		  to_regclass('public.github_owners') IS NOT NULL AND
+		  to_regclass('public.github_owner_logins') IS NOT NULL AND
+		  to_regclass('public.ssh_keys') IS NOT NULL AND
+		  to_regclass('public.github_owner_keys') IS NOT NULL AND
+		  to_regclass('public.zero_key_rechecks') IS NOT NULL AND
+		  to_regclass('public.overflow_queue') IS NOT NULL AND
+		  to_regclass('public.account_queue_ready_source_idx') IS NOT NULL AND
+		  EXISTS (
+		    SELECT 1 FROM information_schema.columns
+		    WHERE table_schema = 'public' AND table_name = 'github_owner_keys'
+		      AND column_name = 'state_changed_scan'
+		  ) AND
+		  EXISTS (
+		    SELECT 1 FROM information_schema.columns
+		    WHERE table_schema = 'public' AND table_name = 'account_queue'
+		      AND column_name = 'last_error_at'
+		  ) AND
+		  EXISTS (
+		    SELECT 1 FROM information_schema.columns
+		    WHERE table_schema = 'public' AND table_name = 'github_owners'
+		      AND column_name = 'refresh_stage'
+		  )
+	`).Scan(&ready)
+	return ready, err
 }
 
 func (s *Store) Recover(ctx context.Context) error {
