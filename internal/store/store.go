@@ -1516,28 +1516,48 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var owners, keys, associations, currentAssociations, queued, overflow int64
 	err := s.Pool.QueryRow(ctx, `
 		SELECT
-		  (SELECT COUNT(*) FROM github_owners),
-		  (SELECT COUNT(*) FROM ssh_keys),
-		  (SELECT COUNT(*) FROM github_owner_keys),
-		  (SELECT COUNT(*) FROM github_owner_keys WHERE currently_present),
-		  (SELECT COUNT(*) FROM account_queue),
-		  (SELECT COUNT(*) FROM overflow_queue)
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'github_owners'), 0),
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'ssh_keys'), 0),
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'github_owner_keys'), 0),
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'github_owner_keys'), 0),
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'account_queue'), 0),
+		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'overflow_queue'), 0)
+		FROM pg_stat_user_tables
+		WHERE relname IN (
+		  'github_owners', 'ssh_keys', 'github_owner_keys',
+		  'account_queue', 'overflow_queue'
+		)
 	`).Scan(&owners, &keys, &associations, &currentAssociations, &queued, &overflow)
 	if err != nil {
 		return nil, err
 	}
 	var zeroKeyRechecks, dueZeroKeyRechecks int64
+	var dueZeroKeyRechecksCapped bool
 	var oldestDueZeroKeyAt *time.Time
 	if err := s.Pool.QueryRow(ctx, `
-		SELECT
-		  COUNT(*),
-		  COUNT(*) FILTER (WHERE next_scan_at <= now()),
-		  MIN(next_scan_at) FILTER (WHERE next_scan_at <= now())
-		FROM zero_key_rechecks
-	`).Scan(
-		&zeroKeyRechecks, &dueZeroKeyRechecks, &oldestDueZeroKeyAt,
-	); err != nil {
+		SELECT COALESCE(n_live_tup, 0)
+		FROM pg_stat_user_tables
+		WHERE relname = 'zero_key_rechecks'
+	`).Scan(&zeroKeyRechecks); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
+	}
+	// A status request must never count an unbounded due queue. The first 10,001
+	// index entries tell us the exact count up to 10,000, or a useful lower bound.
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT COUNT(*), MIN(next_scan_at)
+		FROM (
+		  SELECT next_scan_at
+		  FROM zero_key_rechecks
+		  WHERE next_scan_at <= now()
+		  ORDER BY next_scan_at, github_id
+		  LIMIT 10001
+		) AS due
+	`).Scan(&dueZeroKeyRechecks, &oldestDueZeroKeyAt); err != nil {
+		return nil, err
+	}
+	if dueZeroKeyRechecks > 10000 {
+		dueZeroKeyRechecks = 10000
+		dueZeroKeyRechecksCapped = true
 	}
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, kind, status, cutoff_user_id, next_since_id,
@@ -1617,6 +1637,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	queueRows, err := s.Pool.Query(ctx, `
 		SELECT source, status, COUNT(*)
 		FROM account_queue
+		WHERE status IN ('running', 'retry')
 		GROUP BY source, status
 		ORDER BY source, status
 	`)
@@ -1648,16 +1669,27 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		SELECT
 		  COUNT(*) FILTER (WHERE status = 'retry'),
 		  COUNT(*) FILTER (WHERE status = 'running'),
-		  COALESCE(MAX(attempts), 0),
-		  MIN(created_at)
+		  COALESCE(MAX(attempts), 0)
 		FROM (
-		  SELECT status, attempts, created_at FROM account_queue
+		  SELECT status, attempts FROM account_queue
+		  WHERE status IN ('running', 'retry')
 		  UNION ALL
-		  SELECT status, attempts, created_at FROM overflow_queue
+		  SELECT status, attempts FROM overflow_queue
+		  WHERE status IN ('running', 'retry')
 		) AS jobs
 	`).Scan(
-		&retryingJobs, &runningJobs, &maximumAttempts, &oldestJobAt,
+		&retryingJobs, &runningJobs, &maximumAttempts,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT MIN(created_at)
+		FROM (
+		  (SELECT created_at FROM account_queue ORDER BY id LIMIT 1)
+		  UNION ALL
+		  (SELECT created_at FROM overflow_queue ORDER BY id LIMIT 1)
+		) AS oldest
+	`).Scan(&oldestJobAt); err != nil {
 		return nil, err
 	}
 	var latestQueueError *string
@@ -1666,10 +1698,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		SELECT last_error, last_error_at
 		FROM (
 		  SELECT last_error, last_error_at FROM account_queue
+		  WHERE status = 'retry' AND last_error IS NOT NULL
 		  UNION ALL
 		  SELECT last_error, last_error_at FROM overflow_queue
+		  WHERE status = 'retry' AND last_error IS NOT NULL
 		) AS errors
-		WHERE last_error IS NOT NULL
 		ORDER BY last_error_at DESC NULLS LAST
 		LIMIT 1
 	`).Scan(&latestQueueError, &latestQueueErrorAt)
@@ -1867,15 +1900,23 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	ownerSchedule, _ := s.State(ctx, "owner_refresh_schedule")
 	zeroKeySchedule, _ := s.State(ctx, "zero_key_retry_ages")
 	return map[string]any{
+		"count_accuracy": map[string]any{
+			"index_and_queue_totals": "PostgreSQL live-row estimates; refreshed by autovacuum/analyze",
+			"active_and_retry_jobs":  "exact",
+			"progress_and_workers":   "exact",
+		},
 		"index": map[string]int64{
 			"owners": owners, "keys": keys, "associations": associations,
 			"current_associations": currentAssociations,
 		},
 		"queue": map[string]any{
 			"accounts": queued, "overflow": overflow, "by_source_and_state": queueBreakdown,
+			"counts_approximate": true,
+			"breakdown_scope":    "running and retry jobs only",
 			"zero_key_rechecks": map[string]any{
 				"tracked":       zeroKeyRechecks,
 				"due":           dueZeroKeyRechecks,
+				"due_capped":    dueZeroKeyRechecksCapped,
 				"oldest_due_at": oldestDueZeroKeyAt,
 			},
 		},
