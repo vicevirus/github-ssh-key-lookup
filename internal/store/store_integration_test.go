@@ -474,6 +474,71 @@ func TestEnumerationShardsAreNotDuplicatedAfterRestart(t *testing.T) {
 	}
 }
 
+func TestOwnedEnumerationShardRebalancesIdleWorkersWithoutGaps(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoff := int64(1_000)
+	run.CutoffUserID = &cutoff
+	urlFor := func(since int64) string {
+		return "https://api.github.com/users?since=" + strconv.FormatInt(since, 10)
+	}
+	if err := database.EnsureEnumerationShards(ctx, run, 2, urlFor); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := database.ClaimEnumerationShard(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newUpper, err := database.RebalanceOwnedEnumerationShard(
+		ctx, owned, 4, urlFor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newUpper <= owned.NextSinceID || newUpper >= owned.UpperID {
+		t.Fatalf("owned range was not shortened: %d", newUpper)
+	}
+
+	rows, err := database.Pool.Query(ctx, `
+		SELECT lower_id, upper_id
+		FROM enumeration_shards
+		WHERE run_id = $1 AND status <> 'completed'
+		ORDER BY lower_id
+	`, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ranges [][2]int64
+	for rows.Next() {
+		var lower, upper int64
+		if err := rows.Scan(&lower, &upper); err != nil {
+			t.Fatal(err)
+		}
+		ranges = append(ranges, [2]int64{lower, upper})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 4 {
+		t.Fatalf("active ranges = %d, want 4: %#v", len(ranges), ranges)
+	}
+	if ranges[0][0] != 0 || ranges[len(ranges)-1][1] != cutoff {
+		t.Fatalf("coverage endpoints changed: %#v", ranges)
+	}
+	for index := 1; index < len(ranges); index++ {
+		if ranges[index-1][1] != ranges[index][0] {
+			t.Fatalf("gap or overlap between ranges: %#v", ranges)
+		}
+	}
+}
+
 func TestZeroKeyOnboardingLadderFindsAndRetainsLaterKey(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
