@@ -32,7 +32,7 @@ type Server struct {
 	statusFetched  time.Time
 }
 
-const statusCacheTTL = 30 * time.Second
+const statusCacheTTL = 10 * time.Minute
 
 func New(database *store.Store, logger *slog.Logger) *Server {
 	if logger == nil {
@@ -88,12 +88,6 @@ func (s *Server) health(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) status(response http.ResponseWriter, request *http.Request) {
-	// Status performs several full-table counts and is intentionally cached so
-	// polling dashboards cannot compete with the crawler for PostgreSQL I/O.
-	// Serialize refreshes to avoid a thundering herd when the cache expires.
-	s.statusRefresh.Lock()
-	defer s.statusRefresh.Unlock()
-
 	now := time.Now()
 	s.statusMu.Lock()
 	snapshot, fetched := s.statusSnapshot, s.statusFetched
@@ -103,25 +97,38 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(request.Context(), 20*time.Second)
+	// Status performs several full-table counts. Never make an HTTP caller wait
+	// for those counts: one goroutine refreshes in the background and callers
+	// receive the last snapshot (or a fast warming response on first boot).
+	if s.statusRefresh.TryLock() {
+		go s.refreshStatus()
+	}
+	if snapshot != nil {
+		s.writeStatusSnapshot(response, snapshot, fetched, true)
+		return
+	}
+	writeJSON(response, http.StatusServiceUnavailable, map[string]any{
+		"status": "warming",
+		"status_cache": map[string]any{
+			"stale":   true,
+			"message": "status snapshot is being prepared; use /healthz for liveness",
+		},
+	})
+}
+
+func (s *Server) refreshStatus() {
+	defer s.statusRefresh.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	fresh, err := s.Store.Status(ctx)
 	if err != nil {
-		// A recent snapshot is more useful than turning a temporary database
-		// slowdown into a blank status page. Healthz remains the liveness signal.
-		if snapshot != nil {
-			s.writeStatusSnapshot(response, snapshot, fetched, true)
-			return
-		}
-		s.internalError(response, err)
+		s.Logger.Warn("status snapshot refresh failed", "error", err)
 		return
 	}
 	s.statusMu.Lock()
 	s.statusSnapshot = fresh
 	s.statusFetched = time.Now()
-	fetched = s.statusFetched
 	s.statusMu.Unlock()
-	s.writeStatusSnapshot(response, fresh, fetched, false)
 }
 
 func (s *Server) writeStatusSnapshot(
