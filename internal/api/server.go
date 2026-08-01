@@ -107,7 +107,7 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 		s.writeStatusSnapshot(response, snapshot, fetched, true)
 		return
 	}
-	writeJSON(response, http.StatusServiceUnavailable, map[string]any{
+	writeJSON(response, http.StatusOK, map[string]any{
 		"status": "warming",
 		"status_cache": map[string]any{
 			"stale":   true,
@@ -151,7 +151,10 @@ func (s *Server) writeStatusSnapshot(
 		"ttl_seconds": statusCacheTTL.Seconds(),
 		"stale":       stale || age >= statusCacheTTL,
 	}
-	response.Header().Set("Cache-Control", "public, max-age=30")
+	response.Header().Set(
+		"Cache-Control",
+		fmt.Sprintf("public, max-age=%d", int(statusCacheTTL.Seconds())),
+	)
 	response.Header().Set("X-Status-Snapshot-At", fetched.UTC().Format(time.RFC3339Nano))
 	writeJSON(response, http.StatusOK, body)
 }
