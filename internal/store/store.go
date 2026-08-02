@@ -2222,12 +2222,14 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			}
 		}
 	}
-	searchableGap := max(int64(0), audit.SearchableUsers-initialEnumerated)
+	var searchableGap any
 	verificationState := "measuring_searchable_population"
 	if audit.Complete {
+		gap := max(int64(0), audit.SearchableUsers-initialEnumerated)
+		searchableGap = gap
 		if initialComplete != "true" {
 			verificationState = "initial_crawl_in_progress"
-		} else if searchableGap > 0 {
+		} else if gap > 0 {
 			verificationState = "coverage_gap_detected"
 		} else {
 			verificationState = "count_consistent"
