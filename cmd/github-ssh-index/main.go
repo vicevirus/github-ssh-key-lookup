@@ -81,12 +81,13 @@ func run() error {
 }
 
 func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service {
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
+	tokens := githubTokens()
+	if len(tokens) == 0 || tokens[0] == "" {
 		logger.Error("GITHUB_TOKEN is required for crawler mode")
 		os.Exit(2)
 	}
-	client := githubapi.New(token, env("GITHUB_USER_AGENT", "github-ssh-index/1.0 (security research; contact required)"))
+	client := githubapi.NewWithTokens(tokens, env("GITHUB_USER_AGENT", "github-ssh-index/1.0 (security research; contact required)"))
+	credentialCount := client.CredentialCount()
 	if value := os.Getenv("GITHUB_REST_BASE"); value != "" {
 		client.RESTBase = value
 	}
@@ -94,11 +95,11 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 		client.GraphQLURL = value
 	}
 	config := crawler.DefaultConfig()
-	config.Workers = envInt("GRAPHQL_WORKERS", config.Workers)
+	config.Workers = envInt("GRAPHQL_WORKERS", config.Workers) * credentialCount
 	config.QueueMax = envInt("QUEUE_MAX_ACCOUNTS", config.QueueMax)
-	config.RESTPerHour = envInt("REST_REQUESTS_PER_HOUR", config.RESTPerHour)
-	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour)
-	config.SearchPerHour = envInt("SEARCH_REQUESTS_PER_HOUR", config.SearchPerHour)
+	config.RESTPerHour = envInt("REST_REQUESTS_PER_HOUR", config.RESTPerHour) * credentialCount
+	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour) * credentialCount
+	config.SearchPerHour = envInt("SEARCH_REQUESTS_PER_HOUR", config.SearchPerHour) * credentialCount
 	config.TailPollInterval = envDuration("TAIL_POLL_INTERVAL", config.TailPollInterval)
 	config.OwnerRefresh = envDuration("OWNER_REFRESH_INTERVAL", config.OwnerRefresh)
 	config.OwnerSchedule = envDurations(
@@ -114,6 +115,13 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 		"ESTIMATED_ACCOUNTS_HIGH", int(config.EstimatedAccountsHigh),
 	))
 	return crawler.New(database, client, config, logger)
+}
+
+func githubTokens() []string {
+	return []string{
+		strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		strings.TrimSpace(os.Getenv("GITHUB_TOKEN_SECONDARY")),
+	}
 }
 
 func healthcheck() error {

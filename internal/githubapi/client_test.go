@@ -167,6 +167,92 @@ func TestFetchUsersRecognizesAuthenticationError(t *testing.T) {
 	}
 }
 
+func TestCredentialPoolBalancesEachAPIResource(t *testing.T) {
+	var restHeaders []string
+	var searchHeaders []string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		authorization := request.Header.Get("Authorization")
+		if request.URL.Path == "/search/users" {
+			searchHeaders = append(searchHeaders, authorization)
+			_, _ = response.Write([]byte(`{"total_count":0,"incomplete_results":false,"items":[]}`))
+			return
+		}
+		restHeaders = append(restHeaders, authorization)
+		_, _ = response.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	client := NewWithTokens([]string{"token-a", "token-b"}, "test")
+	client.RESTBase = server.URL
+	client.HTTP = server.Client()
+	for range 2 {
+		if _, err := client.ListUsers(context.Background(), client.UsersURL(0), ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.SearchUserCount(context.Background(), "type:user"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"Bearer token-a", "Bearer token-b"}
+	if fmt.Sprint(restHeaders) != fmt.Sprint(want) {
+		t.Fatalf("REST credentials were not balanced: got %v want %v", restHeaders, want)
+	}
+	if fmt.Sprint(searchHeaders) != fmt.Sprint(want) {
+		t.Fatalf("Search credentials were not balanced independently: got %v want %v", searchHeaders, want)
+	}
+}
+
+func TestCredentialPoolReplaysGraphQLAndDisablesUnauthorizedToken(t *testing.T) {
+	var badCalls atomic.Int32
+	var goodCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Variables struct {
+				IDs []string `json:"ids"`
+			} `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Variables.IDs) != 1 || body.Variables.IDs[0] != "U_1" {
+			t.Fatalf("request body was not replayed: %#v", body)
+		}
+		if request.Header.Get("Authorization") == "Bearer bad-token" {
+			badCalls.Add(1)
+			response.WriteHeader(http.StatusUnauthorized)
+			_, _ = response.Write([]byte(`{"message":"Bad credentials"}`))
+			return
+		}
+		goodCalls.Add(1)
+		_, _ = response.Write([]byte(`{"data":{"nodes":[{"__typename":"User","id":"U_1","databaseId":1,"login":"alice","publicKeys":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}],"rateLimit":{"cost":1,"limit":5000,"remaining":4999,"used":1,"resetAt":"2026-08-02T09:00:00Z"}}}`))
+	}))
+	defer server.Close()
+	client := NewWithTokens([]string{"bad-token", "good-token"}, "test")
+	client.GraphQLURL = server.URL + "/graphql"
+	client.HTTP = server.Client()
+	for range 2 {
+		result, err := client.FetchUsers(context.Background(), []string{"U_1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Nodes) != 1 || result.Nodes[0].Login != "alice" {
+			t.Fatalf("unexpected failover result: %#v", result)
+		}
+	}
+	if badCalls.Load() != 1 || goodCalls.Load() != 2 {
+		t.Fatalf("unexpected credential calls: bad=%d good=%d", badCalls.Load(), goodCalls.Load())
+	}
+	if client.ActiveCredentialCount() != 1 {
+		t.Fatalf("unauthorized credential remained active: %d", client.ActiveCredentialCount())
+	}
+}
+
+func TestCredentialPoolIgnoresEmptyAndDuplicateTokens(t *testing.T) {
+	client := NewWithTokens([]string{" token ", "", "token"}, "test")
+	if client.CredentialCount() != 1 || client.Token != "token" {
+		t.Fatalf("credentials were not normalized: count=%d primary=%q", client.CredentialCount(), client.Token)
+	}
+}
+
 func TestFetchUsersClassifiesSecondaryRateLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusForbidden)

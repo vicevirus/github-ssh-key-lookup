@@ -94,8 +94,8 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	if config.Workers < 1 {
 		config.Workers = 1
 	}
-	if config.Workers > 5 {
-		config.Workers = 5
+	if config.Workers > 10 {
+		config.Workers = 10
 	}
 	if config.QueueMax < 100 {
 		config.QueueMax = 100

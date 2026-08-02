@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/local/github-ssh-index/internal/model"
@@ -60,6 +62,17 @@ type Client struct {
 	UserAgent  string
 	APIVersion string
 	HTTP       *http.Client
+
+	credentialsMu sync.RWMutex
+	credentials   []credential
+	restNext      atomic.Uint64
+	graphqlNext   atomic.Uint64
+	searchNext    atomic.Uint64
+}
+
+type credential struct {
+	token    string
+	disabled bool
 }
 
 type RESTUser struct {
@@ -146,12 +159,38 @@ func (e *AuthenticationError) Error() string {
 }
 
 func New(token, userAgent string) *Client {
+	return NewWithTokens([]string{token}, userAgent)
+}
+
+// NewWithTokens creates one client with independent GitHub credentials. Each
+// API resource is distributed round-robin so its per-user quota remains
+// balanced. A credential returning HTTP 401 is disabled for the lifetime of
+// the process and the request is transparently retried with another token.
+func NewWithTokens(tokens []string, userAgent string) *Client {
+	unique := make([]credential, 0, len(tokens))
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if _, exists := seen[token]; exists {
+			continue
+		}
+		seen[token] = struct{}{}
+		unique = append(unique, credential{token: token})
+	}
+	primary := ""
+	if len(unique) != 0 {
+		primary = unique[0].token
+	}
 	return &Client{
-		Token:      token,
-		RESTBase:   "https://api.github.com",
-		GraphQLURL: "https://api.github.com/graphql",
-		UserAgent:  userAgent,
-		APIVersion: "2026-03-10",
+		Token:       primary,
+		RESTBase:    "https://api.github.com",
+		GraphQLURL:  "https://api.github.com/graphql",
+		UserAgent:   userAgent,
+		APIVersion:  "2026-03-10",
+		credentials: unique,
 		HTTP: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
@@ -161,6 +200,24 @@ func New(token, userAgent string) *Client {
 			},
 		},
 	}
+}
+
+func (c *Client) CredentialCount() int {
+	c.credentialsMu.RLock()
+	defer c.credentialsMu.RUnlock()
+	return len(c.credentials)
+}
+
+func (c *Client) ActiveCredentialCount() int {
+	c.credentialsMu.RLock()
+	defer c.credentialsMu.RUnlock()
+	active := 0
+	for _, item := range c.credentials {
+		if !item.disabled {
+			active++
+		}
+	}
+	return active
 }
 
 func (c *Client) UsersURL(since int64) string {
@@ -177,7 +234,7 @@ func (c *Client) ListUsers(ctx context.Context, requestURL, etag string) (UsersP
 		req.Header.Set("If-None-Match", etag)
 	}
 	started := time.Now()
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return UsersPage{}, err
 	}
@@ -221,7 +278,7 @@ func (c *Client) SearchUserCount(ctx context.Context, query string) (UserSearchC
 	}
 	c.headers(req)
 	started := time.Now()
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return UserSearchCount{}, err
 	}
@@ -269,7 +326,7 @@ func (c *Client) SearchUsers(ctx context.Context, query string, page int) (UserS
 	}
 	c.headers(req)
 	started := time.Now()
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return UserSearchPage{}, err
 	}
@@ -309,7 +366,7 @@ func (c *Client) GetUserByID(ctx context.Context, githubID int64) (*RESTUser, mo
 		return nil, model.Rate{}, err
 	}
 	c.headers(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, model.Rate{}, err
 	}
@@ -421,7 +478,7 @@ func (c *Client) graphql(ctx context.Context, query string, variables map[string
 	c.headers(req)
 	req.Header.Set("Content-Type", "application/json")
 	started := time.Now()
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -446,9 +503,94 @@ func (c *Client) graphql(ctx context.Context, query string, variables map[string
 
 func (c *Client) headers(req *http.Request) {
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("User-Agent", c.UserAgent)
 	req.Header.Set("X-GitHub-Api-Version", c.APIVersion)
+}
+
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	start := c.nextCredential(req)
+	count := c.CredentialCount()
+	if count == 0 {
+		return nil, errors.New("GitHub credential pool is empty")
+	}
+	var lastUnauthorized *http.Response
+	for offset := 0; offset < count; offset++ {
+		index := (start + offset) % count
+		token, active := c.credential(index)
+		if !active {
+			continue
+		}
+		attempt, err := replayRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		attempt.Header.Set("Authorization", "Bearer "+token)
+		response, err := c.HTTP.Do(attempt)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode != http.StatusUnauthorized {
+			if lastUnauthorized != nil {
+				lastUnauthorized.Body.Close()
+			}
+			return response, nil
+		}
+		if lastUnauthorized != nil {
+			lastUnauthorized.Body.Close()
+		}
+		lastUnauthorized = response
+		c.disableCredential(index)
+	}
+	if lastUnauthorized != nil {
+		return lastUnauthorized, nil
+	}
+	return nil, errors.New("all GitHub credentials are disabled")
+}
+
+func (c *Client) nextCredential(req *http.Request) int {
+	var next *atomic.Uint64
+	switch {
+	case strings.HasSuffix(req.URL.Path, "/graphql"):
+		next = &c.graphqlNext
+	case strings.Contains(req.URL.Path, "/search/"):
+		next = &c.searchNext
+	default:
+		next = &c.restNext
+	}
+	return int(next.Add(1) - 1)
+}
+
+func (c *Client) credential(index int) (string, bool) {
+	c.credentialsMu.RLock()
+	defer c.credentialsMu.RUnlock()
+	if index < 0 || index >= len(c.credentials) || c.credentials[index].disabled {
+		return "", false
+	}
+	return c.credentials[index].token, true
+}
+
+func (c *Client) disableCredential(index int) {
+	c.credentialsMu.Lock()
+	defer c.credentialsMu.Unlock()
+	if index >= 0 && index < len(c.credentials) {
+		c.credentials[index].disabled = true
+	}
+}
+
+func replayRequest(req *http.Request) (*http.Request, error) {
+	attempt := req.Clone(req.Context())
+	if req.Body == nil {
+		return attempt, nil
+	}
+	if req.GetBody == nil {
+		return nil, errors.New("GitHub request body cannot be replayed for credential failover")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("replay GitHub request body: %w", err)
+	}
+	attempt.Body = body
+	return attempt, nil
 }
 
 type graphQLError struct {
