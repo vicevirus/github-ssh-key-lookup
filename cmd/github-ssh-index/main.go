@@ -98,6 +98,7 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	config.QueueMax = envInt("QUEUE_MAX_ACCOUNTS", config.QueueMax)
 	config.RESTPerHour = envInt("REST_REQUESTS_PER_HOUR", config.RESTPerHour)
 	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour)
+	config.SearchPerHour = envInt("SEARCH_REQUESTS_PER_HOUR", config.SearchPerHour)
 	config.TailPollInterval = envDuration("TAIL_POLL_INTERVAL", config.TailPollInterval)
 	config.OwnerRefresh = envDuration("OWNER_REFRESH_INTERVAL", config.OwnerRefresh)
 	config.OwnerSchedule = envDurations(

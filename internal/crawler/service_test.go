@@ -41,6 +41,20 @@ func TestRetryDelayGrowsAndCaps(t *testing.T) {
 	}
 }
 
+func TestSearchTimeSplitHasNoOverlapOrGap(t *testing.T) {
+	start := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24*time.Hour - time.Second)
+	leftStart, leftEnd, rightStart, rightEnd, ok := splitSearchTimeRange(start, end)
+	if !ok || !leftStart.Equal(start) || !rightEnd.Equal(end) ||
+		!rightStart.Equal(leftEnd.Add(time.Second)) {
+		t.Fatalf("invalid coverage partition split: %v %v %v %v %v",
+			leftStart, leftEnd, rightStart, rightEnd, ok)
+	}
+	if _, _, _, _, ok := splitSearchTimeRange(start, start); ok {
+		t.Fatal("split a one-second creation range")
+	}
+}
+
 func TestWeightedSchedulerAllocation(t *testing.T) {
 	service := &Service{}
 	counts := map[string]int{}

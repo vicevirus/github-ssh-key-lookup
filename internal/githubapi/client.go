@@ -76,6 +76,13 @@ type UsersPage struct {
 	Elapsed     time.Duration
 }
 
+type UserSearchCount struct {
+	TotalCount        int64
+	IncompleteResults bool
+	Rate              model.Rate
+	Elapsed           time.Duration
+}
+
 type GraphQLKey struct {
 	Key         string `json:"key"`
 	Fingerprint string `json:"fingerprint"`
@@ -188,6 +195,49 @@ func (c *Client) ListUsers(ctx context.Context, requestURL, etag string) (UsersP
 	}
 	page.NextURL = nextLink(resp.Header.Get("Link"))
 	return page, nil
+}
+
+// SearchUserCount returns only the count for a user-search partition. Callers
+// must reject or subdivide incomplete results before treating the count as a
+// coverage measurement.
+func (c *Client) SearchUserCount(ctx context.Context, query string) (UserSearchCount, error) {
+	endpoint := strings.TrimRight(c.RESTBase, "/") + "/search/users"
+	values := url.Values{"q": {query}, "per_page": {"1"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+	if err != nil {
+		return UserSearchCount{}, err
+	}
+	c.headers(req)
+	started := time.Now()
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return UserSearchCount{}, err
+	}
+	defer resp.Body.Close()
+	result := UserSearchCount{
+		Rate: rateFromHeaders(resp.Header), Elapsed: time.Since(started),
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return UserSearchCount{}, rateError(resp)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return UserSearchCount{}, &AuthenticationError{Status: resp.StatusCode, Body: string(body)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return UserSearchCount{}, fmt.Errorf("GitHub user search HTTP %d: %s", resp.StatusCode, body)
+	}
+	var body struct {
+		TotalCount        int64 `json:"total_count"`
+		IncompleteResults bool  `json:"incomplete_results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return UserSearchCount{}, fmt.Errorf("decode GitHub user search: %w", err)
+	}
+	result.TotalCount = body.TotalCount
+	result.IncompleteResults = body.IncompleteResults
+	return result, nil
 }
 
 func (c *Client) FetchUsers(ctx context.Context, ids []string) (UsersAndKeys, error) {

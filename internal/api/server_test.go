@@ -31,7 +31,14 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 			"online": true, "active_workers": 9,
 			"last_heartbeat_at": time.Now(),
 		},
-		"coverage": map[string]any{"initial_complete": false},
+		"coverage": map[string]any{
+			"initial_complete": false, "audit_status": "running",
+			"audit_complete": false, "audit_days_complete": int64(12),
+			"audit_days_total": int64(20), "searchable_users": int64(4567),
+			"initial_enumerated_users": int64(1000),
+			"searchable_user_gap":      int64(3567),
+			"verification_state":       "initial_crawl_in_progress",
+		},
 		"recovery": map[string]any{"retrying_jobs": int64(0)},
 		"runs":     []store.Run{{ErrorUsers: 2}},
 		"workers":  []store.WorkerStatus{{Name: "internal-worker"}},
@@ -50,6 +57,14 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	progress := result["progress"].(map[string]any)
 	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {
 		t.Fatalf("missing compact progress: %#v", progress)
+	}
+	if progress["estimate_scope"] != "current REST ID-range crawl" {
+		t.Fatalf("missing honest estimate scope: %#v", progress)
+	}
+	coverage := result["coverage"].(map[string]any)
+	if coverage["audit_status"] != "running" || coverage["searchable_users"] != int64(4567) ||
+		coverage["verification_state"] != "initial_crawl_in_progress" {
+		t.Fatalf("missing compact coverage audit: %#v", coverage)
 	}
 	errors := result["errors"].(map[string]any)
 	if errors["run_errors"] != int64(2) {

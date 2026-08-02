@@ -53,6 +53,18 @@ type EnumerationShard struct {
 	EnumeratedUsers int64
 }
 
+var CoverageAuditEpoch = time.Date(2007, time.October, 20, 0, 0, 0, 0, time.UTC)
+
+type CoverageAuditProgress struct {
+	Start           time.Time
+	CutoffExclusive time.Time
+	NextDay         time.Time
+	DaysTotal       int64
+	DaysComplete    int64
+	SearchableUsers int64
+	Complete        bool
+}
+
 type Alias struct {
 	Login            string    `json:"login"`
 	FirstSeenAt      time.Time `json:"first_seen_at"`
@@ -291,6 +303,66 @@ func (s *Store) Recover(ctx context.Context) error {
 		WHERE status = 'running';
 	`)
 	return err
+}
+
+func (s *Store) SaveCoverageAuditDay(ctx context.Context, day time.Time, count int64) error {
+	if count < 0 {
+		return errors.New("coverage audit count cannot be negative")
+	}
+	day = day.UTC().Truncate(24 * time.Hour)
+	key := "coverage_audit_day:" + day.Format(time.DateOnly)
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO runtime_state (key, value, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (key) DO UPDATE
+		SET value=excluded.value, updated_at=excluded.updated_at
+	`, key, strconv.FormatInt(count, 10))
+	return err
+}
+
+func (s *Store) CoverageAuditProgress(
+	ctx context.Context, cutoffExclusive time.Time,
+) (CoverageAuditProgress, error) {
+	cutoffExclusive = cutoffExclusive.UTC().Truncate(24 * time.Hour)
+	progress := CoverageAuditProgress{
+		Start: CoverageAuditEpoch, CutoffExclusive: cutoffExclusive,
+		NextDay: CoverageAuditEpoch,
+	}
+	if !cutoffExclusive.After(CoverageAuditEpoch) {
+		progress.NextDay = cutoffExclusive
+		progress.Complete = true
+		return progress, nil
+	}
+	var firstMissing *time.Time
+	err := s.Pool.QueryRow(ctx, `
+		WITH expected AS (
+		  SELECT day::date AS day
+		  FROM generate_series($1::date, $2::date - 1, interval '1 day') AS day
+		), observed AS (
+		  SELECT replace(key, 'coverage_audit_day:', '')::date AS day,
+		         value::bigint AS users
+		  FROM runtime_state
+		  WHERE key LIKE 'coverage_audit_day:%'
+		)
+		SELECT COUNT(*) AS days_total,
+		       COUNT(observed.day) AS days_complete,
+		       COALESCE(SUM(observed.users), 0) AS searchable_users,
+		       MIN(expected.day) FILTER (WHERE observed.day IS NULL)
+		FROM expected LEFT JOIN observed USING (day)
+	`, CoverageAuditEpoch, cutoffExclusive).Scan(
+		&progress.DaysTotal, &progress.DaysComplete,
+		&progress.SearchableUsers, &firstMissing,
+	)
+	if err != nil {
+		return CoverageAuditProgress{}, err
+	}
+	if firstMissing == nil {
+		progress.NextDay = cutoffExclusive
+		progress.Complete = true
+	} else {
+		progress.NextDay = firstMissing.UTC()
+	}
+	return progress, nil
 }
 
 func (s *Store) UpdateWorker(ctx context.Context, update WorkerUpdate) error {
@@ -1422,6 +1494,14 @@ func (s *Store) MaybeCompleteMain(ctx context.Context) (bool, error) {
 		if err := setStateTx(ctx, tx, "initial_complete", "true"); err != nil {
 			return false, err
 		}
+		for key, value := range map[string]string{
+			"initial_enumerated_users": strconv.FormatInt(run.EnumeratedUsers, 10),
+			"initial_processed_users":  strconv.FormatInt(run.ProcessedUsers, 10),
+		} {
+			if err := setStateTx(ctx, tx, key, value); err != nil {
+				return false, err
+			}
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
@@ -2123,6 +2203,41 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	schedulerAllocation, _ := s.State(ctx, "scheduler_allocation")
 	ownerSchedule, _ := s.State(ctx, "owner_refresh_schedule")
 	zeroKeySchedule, _ := s.State(ctx, "zero_key_retry_ages")
+	audit, err := s.CoverageAuditProgress(ctx, time.Now().UTC().Truncate(24*time.Hour))
+	if err != nil {
+		return nil, err
+	}
+	auditStatus, _ := s.State(ctx, "coverage_audit_status")
+	if auditStatus == "" {
+		auditStatus = "pending"
+	}
+	auditLastError, _ := s.State(ctx, "coverage_audit_last_error")
+	auditLastSuccessAt, _ := s.State(ctx, "coverage_audit_last_success_at")
+	initialEnumerated, _ := s.StateInt(ctx, "initial_enumerated_users")
+	if initialEnumerated == 0 {
+		for _, run := range runs {
+			if run.Kind == "initial" {
+				initialEnumerated = run.EnumeratedUsers
+				break
+			}
+		}
+	}
+	searchableGap := max(int64(0), audit.SearchableUsers-initialEnumerated)
+	verificationState := "measuring_searchable_population"
+	if audit.Complete {
+		if initialComplete != "true" {
+			verificationState = "initial_crawl_in_progress"
+		} else if searchableGap > 0 {
+			verificationState = "coverage_gap_detected"
+		} else {
+			verificationState = "count_consistent"
+		}
+	}
+	var auditedThrough *time.Time
+	if audit.NextDay.After(audit.Start) {
+		value := audit.NextDay.Add(-24 * time.Hour)
+		auditedThrough = &value
+	}
 	return map[string]any{
 		"count_accuracy": map[string]any{
 			"index_and_queue_totals": "PostgreSQL live-row estimates; refreshed by autovacuum/analyze",
@@ -2145,11 +2260,23 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			},
 		},
 		"coverage": map[string]any{
-			"initial_complete":      initialComplete == "true",
-			"live_tail_initialized": liveTailInitialized == "true",
-			"tail_highwater":        highwater,
-			"historical_retention":  "observed keys and account associations are retained permanently",
-			"scope":                 "public GitHub SSH authentication keys observable through the API",
+			"initial_complete":         initialComplete == "true",
+			"live_tail_initialized":    liveTailInitialized == "true",
+			"tail_highwater":           highwater,
+			"audit_status":             auditStatus,
+			"audit_complete":           audit.Complete,
+			"audit_days_complete":      audit.DaysComplete,
+			"audit_days_total":         audit.DaysTotal,
+			"audited_through":          auditedThrough,
+			"searchable_users":         audit.SearchableUsers,
+			"initial_enumerated_users": initialEnumerated,
+			"searchable_user_gap":      searchableGap,
+			"verification_state":       verificationState,
+			"audit_last_error":         auditLastError,
+			"audit_last_success_at":    auditLastSuccessAt,
+			"audit_method":             "sum of complete, non-overlapping created-time search partitions",
+			"historical_retention":     "observed keys and account associations are retained permanently",
+			"scope":                    "public GitHub SSH authentication keys observable through the API",
 		},
 		"progress": progress,
 		"enumeration": map[string]any{
