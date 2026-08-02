@@ -1552,7 +1552,7 @@ func claimAccountSourceStatus(
 		  WHERE status = $3
 		    AND next_attempt_at <= now()
 		    AND source = $2
-		  ORDER BY id
+		  ORDER BY next_attempt_at, id
 		  FOR UPDATE SKIP LOCKED
 		  LIMIT $1
 		)
