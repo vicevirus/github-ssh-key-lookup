@@ -1492,30 +1492,38 @@ func (s *Store) ClaimScheduledAccounts(
 	limit int,
 	preferred string,
 ) ([]model.Candidate, error) {
-	preferredSources := []string{"reconcile"}
+	// Claim one exact source at a time. A negative/fallback source predicate
+	// forces PostgreSQL to sort the entire multi-million-row global queue when
+	// the preferred class is empty, while equality can walk the due-source index
+	// and stop after the requested batch.
+	sourceOrder := []string{
+		"anomaly", "reconcile", "global", "tail", "onboarding", "priority",
+	}
 	switch preferred {
 	case "live":
-		preferredSources = []string{"tail", "onboarding"}
+		sourceOrder = []string{
+			"anomaly", "tail", "onboarding", "reconcile", "global", "priority",
+		}
 	case "owner":
-		preferredSources = []string{"priority"}
+		sourceOrder = []string{
+			"anomaly", "priority", "reconcile", "global", "tail", "onboarding",
+		}
 	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	result, err := claimAccountSources(ctx, tx, limit, preferredSources, false)
-	if err != nil {
-		return nil, err
-	}
-	if len(result) < limit {
-		fallback, err := claimAccountSources(
-			ctx, tx, limit-len(result), preferredSources, true,
-		)
+	result := make([]model.Candidate, 0, limit)
+	for _, source := range sourceOrder {
+		if len(result) == limit {
+			break
+		}
+		claimed, err := claimAccountSource(ctx, tx, limit-len(result), source)
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, fallback...)
+		result = append(result, claimed...)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -1524,24 +1532,19 @@ func (s *Store) ClaimScheduledAccounts(
 	return result, nil
 }
 
-func claimAccountSources(
+func claimAccountSource(
 	ctx context.Context,
 	tx pgx.Tx,
 	limit int,
-	sources []string,
-	exclude bool,
+	source string,
 ) ([]model.Candidate, error) {
-	condition := "source = ANY($2::text[])"
-	if exclude {
-		condition = "NOT (source = ANY($2::text[]))"
-	}
-	rows, err := tx.Query(ctx, fmt.Sprintf(`
+	rows, err := tx.Query(ctx, `
 		WITH picked AS (
 		  SELECT id
 		  FROM account_queue
 		  WHERE status IN ('pending', 'retry')
 		    AND next_attempt_at <= now()
-		    AND %s
+		    AND source = $2
 		  ORDER BY next_attempt_at, id
 		  FOR UPDATE SKIP LOCKED
 		  LIMIT $1
@@ -1557,7 +1560,7 @@ func claimAccountSources(
 		          q.node_id, q.login, q.scan_id::text, q.attempts,
 		          q.claim_token::text, q.coverage_generation_id,
 		          q.coverage_partition_id
-	`, condition), limit, sources)
+	`, limit, source)
 	if err != nil {
 		return nil, err
 	}
