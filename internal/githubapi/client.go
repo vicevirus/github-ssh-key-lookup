@@ -24,6 +24,7 @@ query UsersAndKeys($ids: [ID!]!) {
       id
       databaseId
       login
+	  createdAt
       publicKeys(first: 100) {
         totalCount
         pageInfo { hasNextPage endCursor }
@@ -41,6 +42,7 @@ query MoreKeys($id: ID!, $after: String!) {
       id
       databaseId
       login
+	  createdAt
       publicKeys(first: 100, after: $after) {
         totalCount
         pageInfo { hasNextPage endCursor }
@@ -61,10 +63,11 @@ type Client struct {
 }
 
 type RESTUser struct {
-	Login  string `json:"login"`
-	ID     int64  `json:"id"`
-	NodeID string `json:"node_id"`
-	Type   string `json:"type"`
+	Login     string    `json:"login"`
+	ID        int64     `json:"id"`
+	NodeID    string    `json:"node_id"`
+	Type      string    `json:"type"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type UsersPage struct {
@@ -77,6 +80,14 @@ type UsersPage struct {
 }
 
 type UserSearchCount struct {
+	TotalCount        int64
+	IncompleteResults bool
+	Rate              model.Rate
+	Elapsed           time.Duration
+}
+
+type UserSearchPage struct {
+	Items             []RESTUser
 	TotalCount        int64
 	IncompleteResults bool
 	Rate              model.Rate
@@ -104,6 +115,7 @@ type GraphQLUser struct {
 	ID         string        `json:"id"`
 	DatabaseID int64         `json:"databaseId"`
 	Login      string        `json:"login"`
+	CreatedAt  time.Time     `json:"createdAt"`
 	PublicKeys KeyConnection `json:"publicKeys"`
 }
 
@@ -238,6 +250,93 @@ func (c *Client) SearchUserCount(ctx context.Context, query string) (UserSearchC
 	result.TotalCount = body.TotalCount
 	result.IncompleteResults = body.IncompleteResults
 	return result, nil
+}
+
+// SearchUsers enumerates one stable user-search page. Callers must enforce the
+// 1,000-result search ceiling, deduplicate IDs, and compare pre/post counts.
+func (c *Client) SearchUsers(ctx context.Context, query string, page int) (UserSearchPage, error) {
+	if page < 1 || page > 10 {
+		return UserSearchPage{}, fmt.Errorf("GitHub user search page outside 1..10: %d", page)
+	}
+	endpoint := strings.TrimRight(c.RESTBase, "/") + "/search/users"
+	values := url.Values{
+		"q": {query}, "per_page": {"100"}, "page": {strconv.Itoa(page)},
+		"sort": {"joined"}, "order": {"asc"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+	if err != nil {
+		return UserSearchPage{}, err
+	}
+	c.headers(req)
+	started := time.Now()
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return UserSearchPage{}, err
+	}
+	defer resp.Body.Close()
+	result := UserSearchPage{Rate: rateFromHeaders(resp.Header), Elapsed: time.Since(started)}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return UserSearchPage{}, rateError(resp)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return UserSearchPage{}, &AuthenticationError{Status: resp.StatusCode, Body: string(body)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return UserSearchPage{}, fmt.Errorf("GitHub user search HTTP %d: %s", resp.StatusCode, body)
+	}
+	var body struct {
+		TotalCount        int64      `json:"total_count"`
+		IncompleteResults bool       `json:"incomplete_results"`
+		Items             []RESTUser `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return UserSearchPage{}, fmt.Errorf("decode GitHub user search page: %w", err)
+	}
+	result.TotalCount = body.TotalCount
+	result.IncompleteResults = body.IncompleteResults
+	result.Items = body.Items
+	return result, nil
+}
+
+// GetUserByID verifies an immutable account ID after repeated GraphQL nulls.
+// A nil user with no error is a confirmed public-API 404.
+func (c *Client) GetUserByID(ctx context.Context, githubID int64) (*RESTUser, model.Rate, error) {
+	endpoint := fmt.Sprintf("%s/user/%d", strings.TrimRight(c.RESTBase, "/"), githubID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, model.Rate{}, err
+	}
+	c.headers(req)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, model.Rate{}, err
+	}
+	defer resp.Body.Close()
+	rate := rateFromHeaders(resp.Header)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, rate, nil
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return nil, rate, rateError(resp)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, rate, &AuthenticationError{Status: resp.StatusCode, Body: string(body)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, rate, fmt.Errorf("GitHub user-by-ID HTTP %d: %s", resp.StatusCode, body)
+	}
+	var user RESTUser
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return nil, rate, fmt.Errorf("decode GitHub user by ID: %w", err)
+	}
+	if user.ID != githubID {
+		return nil, rate, fmt.Errorf("GitHub user-by-ID mismatch: requested %d, received %d", githubID, user.ID)
+	}
+	return &user, rate, nil
 }
 
 func (c *Client) FetchUsers(ctx context.Context, ids []string) (UsersAndKeys, error) {

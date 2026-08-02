@@ -7,6 +7,7 @@ import (
 
 	"github.com/local/github-ssh-index/internal/githubapi"
 	"github.com/local/github-ssh-index/internal/model"
+	"github.com/local/github-ssh-index/internal/sshkey"
 )
 
 func TestNormalizeUsersRejectsReorderedNodes(t *testing.T) {
@@ -29,10 +30,10 @@ func TestNormalizeUsersPreservesNullNode(t *testing.T) {
 }
 
 func TestRetryDelayGrowsAndCaps(t *testing.T) {
-	if delay := retryDelay(errors.New("temporary"), 1); delay < time.Second || delay > 4*time.Second {
+	if delay := retryDelay(errors.New("temporary"), 1); delay < 5*time.Second || delay > 10*time.Second {
 		t.Fatalf("unexpected first delay: %s", delay)
 	}
-	if delay := retryDelay(errors.New("temporary"), 20); delay < 8*time.Minute || delay > 15*time.Minute {
+	if delay := retryDelay(errors.New("temporary"), 20); delay < 5*time.Hour || delay > 6*time.Hour {
 		t.Fatalf("unexpected capped delay: %s", delay)
 	}
 	limited := &githubapi.RateLimitError{Wait: 37 * time.Second}
@@ -66,15 +67,19 @@ func TestWeightedSchedulerAllocation(t *testing.T) {
 	}
 }
 
-func TestNormalizeKeysSkipsMalformedKeyWithoutPoisoningBatch(t *testing.T) {
-	keys, invalid := normalizeKeys([]githubapi.GraphQLKey{
+func TestNormalizeKeysRejectsPartialSnapshot(t *testing.T) {
+	if _, err := normalizeKeys([]githubapi.GraphQLKey{
 		{Key: "ssh-rsa not-valid-base64"},
-		{Key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"},
-	})
-	if invalid != 1 {
-		t.Fatalf("invalid key count = %d", invalid)
+	}); err == nil {
+		t.Fatal("accepted malformed key snapshot")
 	}
-	if len(keys) != 1 || keys[0].Type != "ssh-ed25519" {
-		t.Fatalf("valid key was lost with malformed neighbor: %#v", keys)
+	raw := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"
+	parsed, err := sshkey.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := normalizeKeys([]githubapi.GraphQLKey{{Key: raw, Fingerprint: parsed.Text}})
+	if err != nil || len(keys) != 1 || keys[0].Type != "ssh-ed25519" {
+		t.Fatalf("valid key was rejected: %#v %v", keys, err)
 	}
 }

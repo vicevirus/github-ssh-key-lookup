@@ -32,7 +32,7 @@ type Server struct {
 	statusFetched  time.Time
 }
 
-const statusCacheTTL = 10 * time.Minute
+const statusCacheTTL = time.Minute
 
 func New(database *store.Store, logger *slog.Logger) *Server {
 	if logger == nil {
@@ -92,6 +92,17 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 	s.statusMu.Lock()
 	snapshot, fetched := s.statusSnapshot, s.statusFetched
 	s.statusMu.Unlock()
+	if snapshot == nil {
+		ctx, cancel := context.WithTimeout(request.Context(), 500*time.Millisecond)
+		persisted, persistedAt, err := s.Store.LoadStatusSnapshot(ctx)
+		cancel()
+		if err == nil {
+			snapshot, fetched = persisted, persistedAt
+			s.statusMu.Lock()
+			s.statusSnapshot, s.statusFetched = persisted, persistedAt
+			s.statusMu.Unlock()
+		}
+	}
 	if snapshot != nil && now.Sub(fetched) < statusCacheTTL {
 		s.writeStatusSnapshot(response, snapshot, fetched, false)
 		return
@@ -157,12 +168,12 @@ func (s *Server) writeStatusSnapshot(
 }
 
 func compactStatusSnapshot(snapshot map[string]any) map[string]any {
-	index, _ := snapshot["index"].(map[string]int64)
-	progress, _ := snapshot["progress"].(map[string]any)
-	crawler, _ := snapshot["crawler"].(map[string]any)
-	coverage, _ := snapshot["coverage"].(map[string]any)
-	recovery, _ := snapshot["recovery"].(map[string]any)
-	estimate, _ := progress["estimated_completion"].(map[string]any)
+	index := anyMap(snapshot["index"])
+	progress := anyMap(snapshot["progress"])
+	crawler := anyMap(snapshot["crawler"])
+	coverage := anyMap(snapshot["coverage"])
+	recovery := anyMap(snapshot["recovery"])
+	estimate := anyMap(progress["estimated_completion"])
 
 	state := "offline"
 	if online, _ := crawler["online"].(bool); online {
@@ -171,6 +182,10 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	var runErrors int64
 	if runs, ok := snapshot["runs"].([]store.Run); ok && len(runs) > 0 {
 		runErrors = runs[0].ErrorUsers
+	} else if runs, ok := snapshot["runs"].([]any); ok && len(runs) > 0 {
+		if run := anyMap(runs[0]); run != nil {
+			runErrors = int64(anyNumber(run["error_users"]))
+		}
 	}
 	return map[string]any{
 		"status": state,
@@ -199,6 +214,14 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 		},
 		"coverage": map[string]any{
 			"initial_complete":         coverage["initial_complete"],
+			"generation_id":            coverage["generation_id"],
+			"generation_status":        coverage["generation_status"],
+			"settled_cutoff":           coverage["settled_cutoff"],
+			"discovered_accounts":      coverage["discovered_accounts"],
+			"successful_accounts":      coverage["successful_accounts"],
+			"inaccessible_accounts":    coverage["inaccessible_accounts"],
+			"unresolved_accounts":      coverage["unresolved_accounts"],
+			"missing_accounts":         coverage["missing_accounts"],
 			"audit_status":             coverage["audit_status"],
 			"audit_complete":           coverage["audit_complete"],
 			"audit_days_complete":      coverage["audit_days_complete"],
@@ -208,6 +231,8 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"initial_enumerated_users": coverage["initial_enumerated_users"],
 			"searchable_user_gap":      coverage["searchable_user_gap"],
 			"verification_state":       coverage["verification_state"],
+			"confidence":               coverage["confidence"],
+			"identity_proven":          false,
 			"audit_last_error":         coverage["audit_last_error"],
 			"audit_last_success_at":    coverage["audit_last_success_at"],
 		},
@@ -215,6 +240,33 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"run_errors":    runErrors,
 			"retrying_jobs": recovery["retrying_jobs"],
 		},
+	}
+}
+
+func anyMap(value any) map[string]any {
+	if result, ok := value.(map[string]any); ok {
+		return result
+	}
+	if integers, ok := value.(map[string]int64); ok {
+		result := make(map[string]any, len(integers))
+		for key, item := range integers {
+			result[key] = item
+		}
+		return result
+	}
+	return map[string]any{}
+}
+
+func anyNumber(value any) float64 {
+	switch number := value.(type) {
+	case float64:
+		return number
+	case int64:
+		return float64(number)
+	case int:
+		return float64(number)
+	default:
+		return 0
 	}
 }
 

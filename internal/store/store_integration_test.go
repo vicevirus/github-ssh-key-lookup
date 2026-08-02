@@ -175,7 +175,8 @@ func TestOverflowPagesFinalizeOnlyAfterLastPage(t *testing.T) {
 	}
 	if err := database.CompleteAccounts(ctx, jobs, []*model.UserResult{{
 		NodeID: "U_9", GitHubID: 9, Login: "many",
-		Keys: []model.PublicKey{firstKey}, HasMoreKeys: true, NextCursor: "cursor-100",
+		Keys: []model.PublicKey{firstKey}, HasMoreKeys: true,
+		NextCursor: "cursor-100", TotalKeyCount: 2,
 	}}, 7*24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +189,23 @@ func TestOverflowPagesFinalizeOnlyAfterLastPage(t *testing.T) {
 	}
 	if err := database.CompleteOverflow(
 		ctx, *overflow, []model.PublicKey{secondKey}, false, "", 7*24*time.Hour,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if matches, err := database.Lookup(ctx, firstKey.Text); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("unstable first-pass keys became visible: %#v", matches)
+	}
+	overflow, err = database.ClaimOverflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overflow.VerificationPass != 2 || overflow.Cursor != "" {
+		t.Fatalf("second verification pass was not started: %#v", overflow)
+	}
+	if err := database.CompleteOverflow(
+		ctx, *overflow, []model.PublicKey{firstKey, secondKey}, false, "", 7*24*time.Hour,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +228,202 @@ func TestOverflowPagesFinalizeOnlyAfterLastPage(t *testing.T) {
 	}
 	if len(users) != 1 || len(users[0].Keys) != 2 {
 		t.Fatalf("indexed user listing omitted overflow keys: %#v", users)
+	}
+}
+
+func TestCoverageLedgerAndConditionalRepairAreExact(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	if err := database.SetState(ctx, "initial_complete", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetState(ctx, "tail_highwater", "100"); err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.CoverageGenerationID == nil {
+		t.Fatal("global run did not create a coverage generation")
+	}
+	created := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	first := model.Candidate{GitHubID: 42, NodeID: "U_42", Login: "covered"}
+	if err := database.ApplyEnumerationPage(
+		ctx, run, []model.Candidate{first}, 42,
+		"https://api.github.com/users?since=42&per_page=100", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 100, "global")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteAccountsScheduled(
+		ctx, jobs, []*model.UserResult{{
+			NodeID: first.NodeID, GitHubID: first.GitHubID,
+			Login: first.Login, CreatedAt: created,
+		}}, []time.Duration{time.Hour}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var discovered, successful, dayCount int64
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT discovered_accounts, successful_accounts
+		FROM coverage_generations WHERE id=$1
+	`, *run.CoverageGenerationID).Scan(&discovered, &successful); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT successful_accounts FROM coverage_day_counts
+		WHERE generation_id=$1 AND day=$2
+	`, *run.CoverageGenerationID, created).Scan(&dayCount); err != nil {
+		t.Fatal(err)
+	}
+	if discovered != 1 || successful != 1 || dayCount != 1 {
+		t.Fatalf(
+			"incorrect coverage counters: discovered=%d successful=%d day=%d",
+			discovered, successful, dayCount,
+		)
+	}
+
+	var partitionID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO coverage_partitions (
+		  generation_id, start_at, end_at, status
+		) VALUES ($1, $2, $3, 'enumerating') RETURNING id
+	`, *run.CoverageGenerationID, created.Truncate(24*time.Hour),
+		created.Truncate(24*time.Hour).Add(time.Minute-time.Second)).Scan(&partitionID); err != nil {
+		t.Fatal(err)
+	}
+	partition := CoveragePartition{
+		ID: partitionID, GenerationID: *run.CoverageGenerationID,
+		Start: created.Truncate(24 * time.Hour),
+		End:   created.Truncate(24 * time.Hour).Add(time.Minute - time.Second),
+	}
+	missing, err := database.StageCoveragePartition(ctx, partition, 2, 2, []model.Candidate{
+		first,
+		{GitHubID: 43, NodeID: "U_43", Login: "missing"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing != 1 {
+		t.Fatalf("conditional repair queued %d accounts, want 1", missing)
+	}
+	jobs, err = database.ClaimScheduledAccounts(ctx, 100, "global")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].GitHubID != 43 || jobs[0].Source != "reconcile" {
+		t.Fatalf("conditional repair claimed unexpected jobs: %#v", jobs)
+	}
+}
+
+func TestClaimLeasesRejectStaleWorkersAndHonorRetryDueTime(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	candidate := model.Candidate{GitHubID: 77, NodeID: "U_77", Login: "leased"}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	oldJobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(oldJobs) != 1 {
+		t.Fatalf("initial claim: jobs=%#v err=%v", oldJobs, err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue SET lease_expires_at=now()-interval '1 second'
+		WHERE id=$1
+	`, oldJobs[0].QueueID); err != nil {
+		t.Fatal(err)
+	}
+	if reaped, err := database.ReapExpiredLeases(ctx); err != nil || reaped != 1 {
+		t.Fatalf("reap: count=%d err=%v", reaped, err)
+	}
+	newJobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(newJobs) != 1 {
+		t.Fatalf("replacement claim: jobs=%#v err=%v", newJobs, err)
+	}
+	if newJobs[0].ClaimToken == oldJobs[0].ClaimToken {
+		t.Fatal("expired claim token was reused")
+	}
+	if err := database.RequeueAccountsAfter(
+		ctx, oldJobs, errors.New("late worker"), time.Hour,
+	); err == nil {
+		t.Fatal("stale worker was allowed to mutate the replacement claim")
+	}
+	if err := database.RequeueAccountsAfter(
+		ctx, newJobs, errors.New("retry later"), time.Hour,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("future retry was claimed early: %#v", claimed)
+	}
+}
+
+func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	candidate := model.Candidate{GitHubID: 88, NodeID: "U_88", Login: "unstable"}
+	firstKey := parsedTestKey(t, 20)
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CompleteAccounts(ctx, jobs, []*model.UserResult{{
+		NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+		Login: candidate.Login, Keys: []model.PublicKey{firstKey},
+		HasMoreKeys: true, NextCursor: "cursor-100", TotalKeyCount: 101,
+	}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `UPDATE overflow_queue SET attempts=7`); err != nil {
+		t.Fatal(err)
+	}
+	overflow, err := database.ClaimOverflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overflow.Attempts != 8 {
+		t.Fatalf("overflow attempts=%d, want 8", overflow.Attempts)
+	}
+	if err := database.RequeueOverflow(
+		ctx, *overflow, errors.New("key set kept changing"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var anomalies, overflowRows, scanRows int
+	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM scan_anomalies`).Scan(&anomalies); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM overflow_queue`).Scan(&overflowRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM key_scan_attempts`).Scan(&scanRows); err != nil {
+		t.Fatal(err)
+	}
+	if anomalies != 1 || overflowRows != 0 || scanRows != 0 {
+		t.Fatalf(
+			"bad overflow quarantine state: anomalies=%d overflow=%d scans=%d",
+			anomalies, overflowRows, scanRows,
+		)
+	}
+	matches, err := database.Lookup(ctx, firstKey.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("unverified overflow key became visible: %#v", matches)
 	}
 }
 

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -44,7 +46,7 @@ func DefaultConfig() Config {
 		QueueMax:         10_000,
 		RESTPerHour:      4_700,
 		GraphQLPerHour:   3_600,
-		SearchPerHour:    600,
+		SearchPerHour:    1_500,
 		RESTReserve:      150,
 		GraphQLReserve:   200,
 		SearchReserve:    2,
@@ -82,6 +84,7 @@ type Service struct {
 
 	scheduleMu     sync.Mutex
 	scheduleCursor int
+	globalPaused   atomic.Bool
 }
 
 func New(database *store.Store, github *githubapi.Client, config Config, logger *slog.Logger) *Service {
@@ -98,7 +101,7 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 		config.QueueMax = 100
 	}
 	if config.SearchPerHour < 1 {
-		config.SearchPerHour = 600
+		config.SearchPerHour = 1_500
 	}
 	if config.EstimatedAccountsLow <= 0 {
 		config.EstimatedAccountsLow = 190_000_000
@@ -172,6 +175,7 @@ func (s *Service) Run(ctx context.Context) error {
 	group.Go(func() error { return s.tail(groupCtx) })
 	group.Go(func() error { return s.priorityOwners(groupCtx) })
 	group.Go(func() error { return s.zeroKeyRechecks(groupCtx) })
+	group.Go(func() error { return s.retryAnomalies(groupCtx) })
 	group.Go(func() error { return s.coverageAudit(groupCtx) })
 	group.Go(func() error { return s.monitorRuns(groupCtx) })
 	return group.Wait()
@@ -200,6 +204,9 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 			}
 			continue
 		}
+		if err := s.waitForGlobalCapacity(ctx, worker, role, run.ID); err != nil {
+			return nil
+		}
 		if err := s.Store.EnsureEnumerationShards(
 			ctx, run, s.Config.Workers, s.GitHub.UsersURL,
 		); err != nil {
@@ -216,6 +223,9 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 			return err
 		}
 		for ctx.Err() == nil {
+			if err := s.waitForGlobalCapacity(ctx, worker, role, run.ID); err != nil {
+				return nil
+			}
 			if err := s.rest.Wait(ctx); err != nil {
 				return nil
 			}
@@ -278,6 +288,42 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 	return nil
 }
 
+func (s *Service) waitForGlobalCapacity(
+	ctx context.Context, worker, role string, runID int64,
+) error {
+	high := int64(max(100, s.Config.QueueMax*8/10))
+	low := int64(max(50, s.Config.QueueMax*4/10))
+	for ctx.Err() == nil {
+		backlog, err := s.Store.GlobalBacklog(ctx, runID)
+		if err != nil {
+			return err
+		}
+		repairDepth, err := s.Store.QueueDepthByClassCapped(ctx, "reconcile", int(high))
+		if err != nil {
+			return err
+		}
+		combined := backlog + int64(repairDepth)
+		paused := s.globalPaused.Load()
+		if paused && combined <= low {
+			s.globalPaused.Store(false)
+			paused = false
+		}
+		if !paused && combined >= high {
+			s.globalPaused.Store(true)
+			paused = true
+		}
+		if !paused {
+			return nil
+		}
+		s.workerActivity(ctx, worker, role, "waiting",
+			fmt.Sprintf("backpressure draining %d global/repair accounts", combined))
+		if err := sleep(ctx, 2*time.Second); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
 func (s *Service) prefill(ctx context.Context) {
 	deadline := time.NewTimer(15 * time.Second)
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -290,13 +336,15 @@ func (s *Service) prefill(ctx context.Context) {
 		case <-deadline.C:
 			return
 		case <-ticker.C:
-			depth, err := s.Store.QueueDepth(ctx)
-			if err == nil && depth >= 500 {
-				return
-			}
 			run, err := s.Store.ActiveMainRun(ctx)
-			if err == nil && run.EnumerationComplete {
-				return
+			if err == nil {
+				if run.EnumerationComplete {
+					return
+				}
+				backlog, backlogErr := s.Store.GlobalBacklog(ctx, run.ID)
+				if backlogErr == nil && backlog >= 500 {
+					return
+				}
 			}
 		}
 	}
@@ -319,20 +367,8 @@ func (s *Service) enumerateMain(ctx context.Context) error {
 			}
 			continue
 		}
-		depth, err := s.Store.QueueDepth(ctx)
-		if err != nil {
-			return err
-		}
-		globalDepth, err := s.Store.QueueDepthByClass(ctx, "global")
-		if err != nil {
-			return err
-		}
-		globalQueueLimit := max(100, s.Config.QueueMax*8/10)
-		if depth >= s.Config.QueueMax || globalDepth >= globalQueueLimit {
-			if err := sleep(ctx, 500*time.Millisecond); err != nil {
-				return nil
-			}
-			continue
+		if err := s.waitForGlobalCapacity(ctx, worker, role, run.ID); err != nil {
+			return nil
 		}
 		if err := s.rest.Wait(ctx); err != nil {
 			return nil
@@ -423,64 +459,143 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			}
 			continue
 		}
+		// Repeated batch failures are isolated so one unusual account cannot
+		// poison 99 healthy neighbors forever.
+		if len(jobs) > 1 && maxJobAttempts(jobs) >= 3 {
+			rest := append([]model.Candidate(nil), jobs[1:]...)
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), rest,
+				errors.New("isolating repeatedly failing GraphQL account"), time.Second,
+			)
+			jobs = jobs[:1]
+		}
 		ids := make([]string, len(jobs))
 		for index := range jobs {
 			ids[index] = jobs[index].NodeID
 		}
 		if err := s.graphql.Wait(ctx); err != nil {
-			_ = s.Store.RequeueAccounts(context.Background(), jobs, err)
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
+			)
 			return nil
 		}
 		response, err := s.GitHub.FetchUsers(ctx, ids)
 		if err != nil {
 			s.workerError(ctx, worker, role, "GraphQL account batch failed", err)
 			s.handleRateError(ctx, err, s.graphql, "graphql")
-			_ = s.Store.RequeueAccounts(context.Background(), jobs, err)
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
+			)
 			if isAuthenticationError(err) {
 				return err
 			}
 			s.Logger.Warn("GraphQL batch failed", "worker", workerID, "users", len(jobs), "error", err)
-			_ = sleep(ctx, retryDelay(err, maxJobAttempts(jobs)))
 			continue
 		}
 		s.graphql.Observe(response.Rate)
 		s.graphql.ExtraCost(response.Rate.Cost)
 		results, err := normalizeUsers(jobs, response.Nodes)
 		if err != nil {
-			_ = s.Store.RequeueAccounts(context.Background(), jobs, err)
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
+			)
 			s.Logger.Error("invalid GitHub key response", "error", err)
-			_ = sleep(ctx, retryDelay(err, maxJobAttempts(jobs)))
 			continue
 		}
+		validJobs := make([]model.Candidate, 0, len(jobs))
+		validResults := make([]*model.UserResult, 0, len(jobs))
+		missingJobs := make([]model.Candidate, 0)
+		for index, result := range results {
+			if result == nil {
+				missingJobs = append(missingJobs, jobs[index])
+				continue
+			}
+			validJobs = append(validJobs, jobs[index])
+			validResults = append(validResults, result)
+		}
 		if err := s.Store.CompleteAccountsScheduled(
-			ctx, jobs, results,
+			ctx, validJobs, validResults,
 			s.Config.OwnerSchedule, s.Config.ZeroKeyRecheckAges,
 		); err != nil {
-			_ = s.Store.RequeueAccounts(context.Background(), jobs, err)
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), validJobs, err,
+				retryDelay(err, maxJobAttempts(validJobs)),
+			)
+			return err
+		}
+		if err := s.handleMissingAccounts(ctx, missingJobs); err != nil {
 			return err
 		}
 		keyCount := 0
-		invalidKeyCount := 0
 		for _, result := range results {
 			if result != nil {
 				keyCount += len(result.Keys)
-				invalidKeyCount += result.InvalidKeys
-				if result.InvalidKeys > 0 {
-					s.Logger.Warn("skipped malformed GitHub public key",
-						"login", result.Login, "github_id", result.GitHubID,
-						"count", result.InvalidKeys)
-				}
 			}
 		}
 		s.workerRequest(
 			ctx, worker, role, "indexed SSH key batch", response.Rate,
-			len(jobs), keyCount,
+			len(validJobs), keyCount,
 		)
 		s.Logger.Info("indexed GraphQL batch",
-			"worker", workerID, "users", len(jobs), "keys", keyCount,
-			"invalid_keys", invalidKeyCount,
+			"worker", workerID, "users", len(validJobs), "keys", keyCount,
 			"cost", response.Rate.Cost, "remaining", response.Rate.Remaining,
 			"latency", response.Elapsed)
+	}
+	return nil
+}
+
+func (s *Service) handleMissingAccounts(
+	ctx context.Context, jobs []model.Candidate,
+) error {
+	for _, job := range jobs {
+		notFound := fmt.Errorf("GitHub GraphQL returned null for account %d", job.GitHubID)
+		if job.Attempts < 3 && job.Source != "anomaly" {
+			delay := time.Hour
+			if job.Attempts >= 2 {
+				delay = 24 * time.Hour
+			}
+			if err := s.Store.RequeueAccountsAfter(
+				context.Background(), []model.Candidate{job}, notFound, delay,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.rest.Wait(ctx); err != nil {
+			return err
+		}
+		user, rate, err := s.GitHub.GetUserByID(ctx, job.GitHubID)
+		if err != nil {
+			s.handleRateError(ctx, err, s.rest, "rest")
+			if requeueErr := s.Store.RequeueAccountsAfter(
+				context.Background(), []model.Candidate{job}, err,
+				retryDelay(err, job.Attempts),
+			); requeueErr != nil {
+				return requeueErr
+			}
+			if isAuthenticationError(err) {
+				return err
+			}
+			continue
+		}
+		s.rest.Observe(rate)
+		if user == nil {
+			if err := s.Store.CompleteInaccessible(ctx, job); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.Store.RefreshClaimIdentity(
+			ctx, job, user.NodeID, user.Login,
+		); err != nil {
+			return err
+		}
+		job.NodeID, job.Login = user.NodeID, user.Login
+		if err := s.Store.RequeueAccountsAfter(
+			context.Background(), []model.Candidate{job}, notFound, 6*time.Hour,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -507,7 +622,21 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		return nil
 	}
-	user, rate, err := s.GitHub.MoreKeys(ctx, job.NodeID, job.Cursor)
+	var user *githubapi.GraphQLUser
+	var rate model.Rate
+	var err error
+	if job.Cursor == "" {
+		var response githubapi.UsersAndKeys
+		response, err = s.GitHub.FetchUsers(ctx, []string{job.NodeID})
+		if err == nil {
+			rate = response.Rate
+			if len(response.Nodes) == 1 {
+				user = response.Nodes[0]
+			}
+		}
+	} else {
+		user, rate, err = s.GitHub.MoreKeys(ctx, job.NodeID, job.Cursor)
+	}
 	if err != nil {
 		s.workerError(ctx, worker, role, "GraphQL overflow page failed", err)
 		s.handleRateError(ctx, err, s.graphql, "graphql")
@@ -525,18 +654,52 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		return nil
 	}
-	keys, invalidKeys := normalizeKeys(user.PublicKeys.Nodes)
-	if invalidKeys > 0 {
-		s.Logger.Warn("skipped malformed GitHub overflow public key",
-			"login", user.Login, "github_id", job.GitHubID,
-			"count", invalidKeys)
+	if user.ID != job.NodeID || user.DatabaseID != job.GitHubID {
+		err = fmt.Errorf(
+			"overflow identity mismatch: expected %s/%d, received %s/%d",
+			job.NodeID, job.GitHubID, user.ID, user.DatabaseID,
+		)
+		_ = s.Store.RequeueOverflowAfter(
+			context.Background(), job, err, retryDelay(err, job.Attempts),
+		)
+		return nil
+	}
+	keys, normalizeErr := normalizeKeys(user.PublicKeys.Nodes)
+	if normalizeErr != nil {
+		_ = s.Store.RequeueOverflowAfter(
+			context.Background(), job, normalizeErr,
+			retryDelay(normalizeErr, job.Attempts),
+		)
+		return nil
+	}
+	if job.ExpectedKeyCount >= 0 && user.PublicKeys.TotalCount != job.ExpectedKeyCount {
+		reason := fmt.Sprintf(
+			"overflow total changed from %d to %d",
+			job.ExpectedKeyCount, user.PublicKeys.TotalCount,
+		)
+		if err := s.Store.RestartOverflowScan(ctx, job, reason); err != nil {
+			return err
+		}
+		return nil
+	}
+	if user.PublicKeys.TotalCount < len(keys) ||
+		(user.PublicKeys.PageInfo.HasNextPage && user.PublicKeys.PageInfo.EndCursor == "") {
+		err := fmt.Errorf(
+			"overflow connection inconsistent: total=%d nodes=%d has_more=%t",
+			user.PublicKeys.TotalCount, len(keys), user.PublicKeys.PageInfo.HasNextPage,
+		)
+		_ = s.Store.RequeueOverflowAfter(
+			context.Background(), job, err, retryDelay(err, job.Attempts),
+		)
+		return nil
 	}
 	s.workerRequest(
 		ctx, worker, role, "indexed overflow SSH key page", rate, 0, len(keys),
 	)
-	err = s.Store.CompleteOverflowScheduled(
+	err = s.Store.CompleteOverflowPageScheduled(
 		ctx, job, keys, user.PublicKeys.PageInfo.HasNextPage,
-		user.PublicKeys.PageInfo.EndCursor, s.Config.OwnerSchedule,
+		user.PublicKeys.PageInfo.EndCursor, user.PublicKeys.TotalCount,
+		s.Config.OwnerSchedule,
 	)
 	if err != nil {
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
@@ -557,40 +720,58 @@ func normalizeUsers(jobs []model.Candidate, nodes []*githubapi.GraphQLUser) ([]*
 		if user == nil || user.TypeName != "User" {
 			continue
 		}
-		if user.DatabaseID != 0 && user.DatabaseID != jobs[index].GitHubID {
+		if user.ID != jobs[index].NodeID || user.DatabaseID != jobs[index].GitHubID {
 			return nil, fmt.Errorf(
-				"GraphQL response order mismatch: expected %d, received %d",
-				jobs[index].GitHubID, user.DatabaseID,
+				"GraphQL identity mismatch: expected %s/%d, received %s/%d",
+				jobs[index].NodeID, jobs[index].GitHubID, user.ID, user.DatabaseID,
 			)
 		}
-		keys, invalidKeys := normalizeKeys(user.PublicKeys.Nodes)
+		if user.CreatedAt.IsZero() {
+			return nil, fmt.Errorf("GraphQL account %d has no createdAt", user.DatabaseID)
+		}
+		keys, err := normalizeKeys(user.PublicKeys.Nodes)
+		if err != nil {
+			return nil, fmt.Errorf("GraphQL account %d key snapshot: %w", user.DatabaseID, err)
+		}
+		if user.PublicKeys.TotalCount < len(keys) ||
+			(!user.PublicKeys.PageInfo.HasNextPage && user.PublicKeys.TotalCount != len(keys)) ||
+			(user.PublicKeys.PageInfo.HasNextPage &&
+				(user.PublicKeys.TotalCount <= len(keys) || user.PublicKeys.PageInfo.EndCursor == "")) {
+			return nil, fmt.Errorf(
+				"GraphQL account %d inconsistent key connection: total=%d nodes=%d has_more=%t",
+				user.DatabaseID, user.PublicKeys.TotalCount, len(keys),
+				user.PublicKeys.PageInfo.HasNextPage,
+			)
+		}
 		results[index] = &model.UserResult{
 			NodeID: user.ID, GitHubID: jobs[index].GitHubID, Login: user.Login,
-			Keys: keys, HasMoreKeys: user.PublicKeys.PageInfo.HasNextPage,
+			CreatedAt: user.CreatedAt,
+			Keys:      keys, HasMoreKeys: user.PublicKeys.PageInfo.HasNextPage,
 			NextCursor:    user.PublicKeys.PageInfo.EndCursor,
 			TotalKeyCount: user.PublicKeys.TotalCount,
-			InvalidKeys:   invalidKeys,
 		}
 	}
 	return results, nil
 }
 
-func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, int) {
+func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {
 	result := make([]model.PublicKey, 0, len(keys))
-	invalid := 0
+	seen := make(map[string]bool, len(keys))
 	for _, raw := range keys {
 		key, err := sshkey.Parse(raw.Key)
 		if err != nil {
-			invalid++
-			continue
+			return nil, err
 		}
-		if strings.HasPrefix(raw.Fingerprint, "SHA256:") && raw.Fingerprint != key.Text {
-			invalid++
-			continue
+		if raw.Fingerprint == "" || raw.Fingerprint != key.Text {
+			return nil, fmt.Errorf("fingerprint mismatch: GitHub=%q calculated=%q", raw.Fingerprint, key.Text)
 		}
+		if seen[key.Text] {
+			return nil, fmt.Errorf("duplicate key fingerprint %s", key.Text)
+		}
+		seen[key.Text] = true
 		result = append(result, key)
 	}
-	return result, invalid
+	return result, nil
 }
 
 func (s *Service) tail(ctx context.Context) error {
@@ -603,17 +784,15 @@ func (s *Service) tail(ctx context.Context) error {
 	}
 	failures := 0
 	for ctx.Err() == nil {
-		depth, err := s.Store.QueueDepth(ctx)
-		if err != nil {
-			return err
-		}
-		liveDepth, err := s.Store.QueueDepthByClass(ctx, "live")
-		if err != nil {
-			return err
-		}
 		liveQueueLimit := max(100, s.Config.QueueMax/10)
-		if depth >= s.Config.QueueMax || liveDepth >= liveQueueLimit {
-			if err := sleep(ctx, 250*time.Millisecond); err != nil {
+		liveDepth, err := s.Store.QueueDepthByClassCapped(
+			ctx, "live", liveQueueLimit,
+		)
+		if err != nil {
+			return err
+		}
+		if liveDepth >= liveQueueLimit {
+			if err := sleep(ctx, 2*time.Second); err != nil {
 				return nil
 			}
 			continue
@@ -694,57 +873,179 @@ func (s *Service) tail(ctx context.Context) error {
 func (s *Service) coverageAudit(ctx context.Context) error {
 	const worker = "coverage-auditor"
 	const role = "searchable account coverage audit"
-	s.workerActivity(ctx, worker, role, "running", "checking durable date partitions")
+	s.workerActivity(ctx, worker, role, "running", "waiting for an auditable generation")
 	defer s.Store.StopWorker(context.Background(), worker, role)
-	failures := 0
 	for ctx.Err() == nil {
-		cutoff := time.Now().UTC().Truncate(24 * time.Hour)
-		progress, err := s.Store.CoverageAuditProgress(ctx, cutoff)
+		generation, err := s.Store.CoverageAuditGeneration(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := sleep(ctx, time.Minute); err != nil {
+				return nil
+			}
+			continue
+		}
 		if err != nil {
-			failures++
-			s.coverageAuditError(ctx, worker, role, err)
-			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
+			return err
+		}
+		if err := s.Store.EnsureCoveragePartitions(ctx, generation); err != nil {
+			return err
+		}
+		partition, err := s.Store.ClaimCoveragePartition(ctx, generation.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			finished, finalizeErr := s.Store.FinalizeCoverageGeneration(ctx, generation.ID)
+			if finalizeErr != nil {
+				return finalizeErr
+			}
+			if finished {
+				s.workerActivity(ctx, worker, role, "waiting",
+					fmt.Sprintf("coverage generation %d reconciled", generation.ID))
+			}
+			if err := sleep(ctx, time.Minute); err != nil {
 				return nil
 			}
 			continue
 		}
-		if progress.Complete {
-			_ = s.Store.SetState(ctx, "coverage_audit_status", "complete")
-			_ = s.Store.SetState(ctx, "coverage_audit_last_error", "")
-			s.workerActivity(ctx, worker, role, "waiting",
-				fmt.Sprintf("audited searchable accounts through %s",
-					cutoff.Add(-24*time.Hour).Format(time.DateOnly)))
-			next := cutoff.Add(24*time.Hour + 15*time.Minute)
-			if err := sleep(ctx, time.Until(next)); err != nil {
-				return nil
-			}
-			continue
+		if err != nil {
+			return err
 		}
-
-		day := progress.NextDay
-		_ = s.Store.SetState(ctx, "coverage_audit_status", "running")
 		s.workerActivity(ctx, worker, role, "running",
-			fmt.Sprintf("counting searchable users created %s", day.Format(time.DateOnly)))
-		count, err := s.searchUserCountRange(
-			ctx, worker, role, day, day.Add(24*time.Hour-time.Second),
+			fmt.Sprintf("auditing creation range %s to %s",
+				partition.Start.Format(time.RFC3339), partition.End.Format(time.RFC3339)))
+		count, err := s.searchUserCount(
+			ctx, worker, role, partition.Start, partition.End,
 		)
-		if err == nil {
-			err = s.Store.SaveCoverageAuditDay(ctx, day, count)
-		}
 		if err != nil {
-			failures++
 			s.coverageAuditError(ctx, worker, role, err)
-			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
-				return nil
+			_ = s.Store.RetryCoveragePartition(
+				context.Background(), partition, err, retryDelay(err, partition.Attempts),
+			)
+			if isAuthenticationError(err) {
+				return err
 			}
 			continue
 		}
-		failures = 0
-		_ = s.Store.SetState(ctx, "coverage_audit_last_error", "")
+		if count.IncompleteResults || count.TotalCount > 1_000 {
+			if err := s.Store.SplitCoveragePartition(
+				ctx, partition, count.TotalCount, count.IncompleteResults,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		if partition.LocalCount != nil && *partition.LocalCount == count.TotalCount {
+			if err := s.Store.MarkCoverageCountConsistent(
+				ctx, partition, count.TotalCount, *partition.LocalCount,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		candidates, err := s.enumerateSearchPartition(
+			ctx, worker, role, partition.Start, partition.End, count.TotalCount,
+		)
+		if err != nil {
+			_ = s.Store.RetryCoveragePartition(
+				context.Background(), partition, err, retryDelay(err, partition.Attempts),
+			)
+			continue
+		}
+		post, err := s.searchUserCount(ctx, worker, role, partition.Start, partition.End)
+		if err != nil || post.IncompleteResults || post.TotalCount != count.TotalCount ||
+			int64(len(candidates)) != count.TotalCount {
+			if err == nil {
+				err = fmt.Errorf(
+					"unstable Search partition: pre=%d post=%d unique=%d incomplete=%t",
+					count.TotalCount, post.TotalCount, len(candidates), post.IncompleteResults,
+				)
+			}
+			_ = s.Store.RetryCoveragePartition(
+				context.Background(), partition, err, retryDelay(err, partition.Attempts),
+			)
+			continue
+		}
+		if _, err := s.Store.StageCoveragePartition(
+			ctx, partition, count.TotalCount, post.TotalCount, candidates,
+		); err != nil {
+			return err
+		}
 		_ = s.Store.SetState(ctx, "coverage_audit_last_success_at",
 			time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	return nil
+}
+
+func (s *Service) searchUserCount(
+	ctx context.Context, worker, role string, start, end time.Time,
+) (githubapi.UserSearchCount, error) {
+	const timestamp = "2006-01-02T15:04:05Z"
+	query := fmt.Sprintf(
+		"type:user created:%s..%s",
+		start.UTC().Format(timestamp), end.UTC().Format(timestamp),
+	)
+	if err := s.search.Wait(ctx); err != nil {
+		return githubapi.UserSearchCount{}, err
+	}
+	result, err := s.GitHub.SearchUserCount(ctx, query)
+	if err != nil {
+		s.handleRateError(ctx, err, s.search, "search")
+		return githubapi.UserSearchCount{}, err
+	}
+	s.search.Observe(result.Rate)
+	s.recordPacer(ctx, "search", s.search)
+	s.workerRequest(ctx, worker, role, "counted Search creation range", result.Rate, 0, 0)
+	return result, nil
+}
+
+func (s *Service) enumerateSearchPartition(
+	ctx context.Context,
+	worker, role string,
+	start, end time.Time,
+	total int64,
+) ([]model.Candidate, error) {
+	if total < 0 || total > 1_000 {
+		return nil, fmt.Errorf("Search partition total outside 0..1000: %d", total)
+	}
+	const timestamp = "2006-01-02T15:04:05Z"
+	query := fmt.Sprintf(
+		"type:user created:%s..%s",
+		start.UTC().Format(timestamp), end.UTC().Format(timestamp),
+	)
+	unique := make(map[int64]model.Candidate, total)
+	pages := int((total + 99) / 100)
+	for page := 1; page <= pages; page++ {
+		if err := s.search.Wait(ctx); err != nil {
+			return nil, err
+		}
+		result, err := s.GitHub.SearchUsers(ctx, query, page)
+		if err != nil {
+			s.handleRateError(ctx, err, s.search, "search")
+			return nil, err
+		}
+		s.search.Observe(result.Rate)
+		if result.IncompleteResults || result.TotalCount != total {
+			return nil, fmt.Errorf(
+				"Search page drift: expected=%d received=%d incomplete=%t",
+				total, result.TotalCount, result.IncompleteResults,
+			)
+		}
+		for _, user := range result.Items {
+			if user.Type != "User" || user.ID <= 0 || user.NodeID == "" || user.Login == "" {
+				return nil, fmt.Errorf("invalid user identity in Search page %d", page)
+			}
+			if _, exists := unique[user.ID]; exists {
+				return nil, fmt.Errorf("duplicate GitHub ID %d in Search partition", user.ID)
+			}
+			unique[user.ID] = model.Candidate{
+				GitHubID: user.ID, NodeID: user.NodeID, Login: user.Login,
+			}
+		}
+		s.workerRequest(ctx, worker, role, "enumerated Search repair page", result.Rate, len(result.Items), 0)
+	}
+	result := make([]model.Candidate, 0, len(unique))
+	for _, candidate := range unique {
+		result = append(result, candidate)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].GitHubID < result[j].GitHubID })
+	return result, nil
 }
 
 func (s *Service) coverageAuditError(
@@ -947,22 +1248,17 @@ func (s *Service) priorityOwners(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			depth, err := s.Store.QueueDepth(ctx)
-			if err != nil {
-				return err
-			}
-			ownerDepth, err := s.Store.QueueDepthByClass(ctx, "owner")
-			if err != nil {
-				return err
-			}
 			ownerQueueLimit := max(100, s.Config.QueueMax/10)
-			if depth >= s.Config.QueueMax || ownerDepth >= ownerQueueLimit {
+			ownerDepth, err := s.Store.QueueDepthByClassCapped(
+				ctx, "owner", ownerQueueLimit,
+			)
+			if err != nil {
+				return err
+			}
+			if ownerDepth >= ownerQueueLimit {
 				continue
 			}
-			limit := min(
-				ownerQueueLimit-ownerDepth,
-				s.Config.QueueMax-depth,
-			)
+			limit := ownerQueueLimit - ownerDepth
 			inserted, err := s.Store.EnqueueDueOwners(ctx, limit)
 			if err != nil {
 				s.workerError(ctx, worker, role, "failed to enqueue owner refresh", err)
@@ -989,22 +1285,17 @@ func (s *Service) zeroKeyRechecks(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			depth, err := s.Store.QueueDepth(ctx)
-			if err != nil {
-				return err
-			}
-			liveDepth, err := s.Store.QueueDepthByClass(ctx, "live")
-			if err != nil {
-				return err
-			}
 			liveQueueLimit := max(100, s.Config.QueueMax/10)
-			if depth >= s.Config.QueueMax || liveDepth >= liveQueueLimit {
+			liveDepth, err := s.Store.QueueDepthByClassCapped(
+				ctx, "live", liveQueueLimit,
+			)
+			if err != nil {
+				return err
+			}
+			if liveDepth >= liveQueueLimit {
 				continue
 			}
-			limit := min(
-				liveQueueLimit-liveDepth,
-				s.Config.QueueMax-depth,
-			)
+			limit := liveQueueLimit - liveDepth
 			inserted, err := s.Store.EnqueueDueZeroKeyRechecks(ctx, limit)
 			if err != nil {
 				s.workerError(ctx, worker, role, "failed to enqueue zero-key rechecks", err)
@@ -1019,6 +1310,31 @@ func (s *Service) zeroKeyRechecks(ctx context.Context) error {
 	}
 }
 
+func (s *Service) retryAnomalies(ctx context.Context) error {
+	const worker = "anomaly-retries"
+	const role = "persistent anomaly retry scheduler"
+	s.workerActivity(ctx, worker, role, "starting", "scheduling unresolved account retries")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			inserted, err := s.Store.EnqueueDueAnomalies(ctx, 100)
+			if err != nil {
+				return err
+			}
+			activity := "persistent anomaly queue is current"
+			if inserted > 0 {
+				activity = fmt.Sprintf("enqueued %d persistent anomaly retries", inserted)
+			}
+			s.workerActivity(ctx, worker, role, "waiting", activity)
+		}
+	}
+}
+
 func (s *Service) monitorRuns(ctx context.Context) error {
 	const worker = "run-monitor"
 	const role = "crawl run monitor"
@@ -1027,11 +1343,53 @@ func (s *Service) monitorRuns(ctx context.Context) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	nextHeartbeat := time.Time{}
+	nextLeaseReap := time.Time{}
+	nextSnapshot := time.Time{}
+	monitorStarted := time.Now()
+	nextWatchdog := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if time.Now().After(nextWatchdog) {
+				due, graphQLSuccess, restSuccess, err := s.Store.DueWorkHealth(ctx)
+				if err != nil {
+					return err
+				}
+				now := time.Now()
+				graphqlCooldown := s.graphql.Snapshot().CooldownUntil
+				if due && graphqlCooldown == nil && now.Sub(monitorStarted) > 10*time.Minute &&
+					(graphQLSuccess == nil || now.Sub(*graphQLSuccess) > 10*time.Minute) {
+					return errors.New("GraphQL watchdog: due work made no progress for 10 minutes")
+				}
+				run, runErr := s.Store.ActiveMainRun(ctx)
+				if runErr == nil && !run.EnumerationComplete {
+					backlog := run.EnumeratedUsers - run.ProcessedUsers
+					restCooldown := s.rest.Snapshot().CooldownUntil
+					if backlog < int64(max(50, s.Config.QueueMax*4/10)) &&
+						restCooldown == nil && now.Sub(monitorStarted) > 10*time.Minute &&
+						(restSuccess == nil || now.Sub(*restSuccess) > 10*time.Minute) {
+						return errors.New("REST watchdog: unfinished enumeration made no progress for 10 minutes")
+					}
+				}
+				nextWatchdog = now.Add(30 * time.Second)
+			}
+			if time.Now().After(nextSnapshot) {
+				if err := s.Store.SaveRateSample(ctx); err != nil {
+					return err
+				}
+				if err := s.Store.SaveStatusSnapshot(ctx); err != nil {
+					s.Logger.Warn("persist status snapshot failed", "error", err)
+				}
+				nextSnapshot = time.Now().Add(time.Minute)
+			}
+			if time.Now().After(nextLeaseReap) {
+				if _, err := s.Store.ReapExpiredLeases(ctx); err != nil {
+					return err
+				}
+				nextLeaseReap = time.Now().Add(time.Minute)
+			}
 			if time.Now().After(nextHeartbeat) {
 				s.workerActivity(ctx, worker, role, "running", "monitoring active crawl")
 				nextHeartbeat = time.Now().Add(30 * time.Second)
@@ -1124,10 +1482,10 @@ func retryDelay(err error, attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	exponent := min(attempt-1, 9)
-	delay := time.Duration(1<<exponent)*time.Second +
-		time.Duration(rand.Intn(4))*time.Second
-	return min(delay, 15*time.Minute)
+	exponent := min(attempt-1, 12)
+	delay := time.Duration(1<<exponent)*5*time.Second +
+		time.Duration(rand.Intn(6))*time.Second
+	return min(delay, 6*time.Hour)
 }
 
 func maxJobAttempts(jobs []model.Candidate) int {
