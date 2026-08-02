@@ -427,6 +427,13 @@ func TestMarkAccountsAttemptedIsDurableAndIdempotent(t *testing.T) {
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("claim: jobs=%#v err=%v", jobs, err)
 	}
+	// Simulate a crash after the durable per-account observation was written
+	// but before its aggregate run counter was advanced.
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue SET first_attempted_at=now() WHERE id=$1
+	`, jobs[0].QueueID); err != nil {
+		t.Fatal(err)
+	}
 	if err := database.MarkAccountsAttempted(ctx, jobs); err != nil {
 		t.Fatal(err)
 	}
@@ -435,16 +442,23 @@ func TestMarkAccountsAttemptedIsDurableAndIdempotent(t *testing.T) {
 	}
 	var attempted int64
 	var firstAttemptedAt *time.Time
+	var firstAttemptCountedAt *time.Time
 	if err := database.Pool.QueryRow(ctx, `
-		SELECT run.attempted_users, queue.first_attempted_at
+		SELECT run.attempted_users, queue.first_attempted_at,
+		       queue.first_attempt_counted_at
 		FROM crawl_runs AS run
 		JOIN account_queue AS queue ON queue.run_id=run.id
 		WHERE run.id=$1
-	`, runID).Scan(&attempted, &firstAttemptedAt); err != nil {
+	`, runID).Scan(
+		&attempted, &firstAttemptedAt, &firstAttemptCountedAt,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if attempted != 1 || firstAttemptedAt == nil {
-		t.Fatalf("attempt progress was not persisted exactly once: count=%d at=%v", attempted, firstAttemptedAt)
+	if attempted != 1 || firstAttemptedAt == nil || firstAttemptCountedAt == nil {
+		t.Fatalf(
+			"attempt progress was not persisted exactly once: count=%d observed=%v counted=%v",
+			attempted, firstAttemptedAt, firstAttemptCountedAt,
+		)
 	}
 }
 

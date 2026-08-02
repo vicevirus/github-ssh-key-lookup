@@ -1489,8 +1489,11 @@ func (s *Store) ClaimAccounts(ctx context.Context, limit int, preferPriority boo
 }
 
 // MarkAccountsAttempted records the first successful GraphQL observation for
-// each claimed queue item. It is transactional and idempotent so a database
-// failure or crawler restart cannot double-count first-pass progress.
+// each claimed queue item. The observation and its aggregate counter use a
+// restart-safe two-phase protocol: first persist the per-job marker without
+// locking crawl_runs, then lock crawl_runs before counting uncounted markers.
+// This preserves exactness without reversing the run->queue lock order used by
+// enumeration transactions.
 func (s *Store) MarkAccountsAttempted(
 	ctx context.Context, jobs []model.Candidate,
 ) error {
@@ -1511,8 +1514,47 @@ func (s *Store) MarkAccountsAttempted(
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `
-		SELECT queue.id, queue.run_id, queue.first_attempted_at
+	tag, err := tx.Exec(ctx, `
+		UPDATE account_queue AS queue
+		SET first_attempted_at=COALESCE(queue.first_attempted_at, now())
+		FROM unnest($1::bigint[], $2::text[]) AS claim(id, token)
+		WHERE claim.id=queue.id AND claim.token=queue.claim_token::text
+	`, queueIDs, claimTokens)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(jobs)) {
+		return fmt.Errorf(
+			"stale account claims while marking attempts: matched %d of %d",
+			tag.RowsAffected(), len(jobs),
+		)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	runIDs := make([]int64, 0, len(jobs))
+	seenRuns := make(map[int64]struct{})
+	for _, job := range jobs {
+		if job.RunID == nil {
+			continue
+		}
+		if _, exists := seenRuns[*job.RunID]; exists {
+			continue
+		}
+		seenRuns[*job.RunID] = struct{}{}
+		runIDs = append(runIDs, *job.RunID)
+	}
+	countTx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer countTx.Rollback(ctx)
+	if err := lockCrawlRuns(ctx, countTx, runIDs); err != nil {
+		return err
+	}
+	rows, err := countTx.Query(ctx, `
+		SELECT queue.id, queue.run_id, queue.first_attempt_counted_at
 		FROM account_queue AS queue
 		JOIN unnest($1::bigint[], $2::text[]) AS claim(id, token)
 		  ON claim.id=queue.id AND claim.token=queue.claim_token::text
@@ -1521,22 +1563,22 @@ func (s *Store) MarkAccountsAttempted(
 	if err != nil {
 		return err
 	}
-	unmarked := make([]int64, 0, len(jobs))
+	uncounted := make([]int64, 0, len(jobs))
 	runCounts := make(map[int64]int64)
 	matched := 0
 	for rows.Next() {
 		var queueID int64
 		var runID *int64
-		var attemptedAt *time.Time
-		if err := rows.Scan(&queueID, &runID, &attemptedAt); err != nil {
+		var countedAt *time.Time
+		if err := rows.Scan(&queueID, &runID, &countedAt); err != nil {
 			rows.Close()
 			return err
 		}
 		matched++
-		if attemptedAt != nil {
+		if countedAt != nil {
 			continue
 		}
-		unmarked = append(unmarked, queueID)
+		uncounted = append(uncounted, queueID)
 		if runID != nil {
 			runCounts[*runID]++
 		}
@@ -1549,28 +1591,11 @@ func (s *Store) MarkAccountsAttempted(
 	if matched != len(jobs) {
 		return fmt.Errorf("stale account claims while marking attempts: matched %d of %d", matched, len(jobs))
 	}
-	if len(unmarked) == 0 {
-		return tx.Commit(ctx)
-	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE account_queue SET first_attempted_at=now()
-		WHERE id=ANY($1) AND first_attempted_at IS NULL
-	`, unmarked)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != int64(len(unmarked)) {
-		return errors.New("account first-attempt state changed while locked")
-	}
-	runIDs := make([]int64, 0, len(runCounts))
-	for runID := range runCounts {
-		runIDs = append(runIDs, runID)
-	}
-	if err := lockCrawlRuns(ctx, tx, runIDs); err != nil {
-		return err
+	if len(uncounted) == 0 {
+		return countTx.Commit(ctx)
 	}
 	for runID, count := range runCounts {
-		if _, err := tx.Exec(ctx, `
+		if _, err := countTx.Exec(ctx, `
 			UPDATE crawl_runs
 			SET attempted_users=LEAST(enumerated_users, attempted_users+$2)
 			WHERE id=$1
@@ -1578,7 +1603,17 @@ func (s *Store) MarkAccountsAttempted(
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	tag, err = countTx.Exec(ctx, `
+		UPDATE account_queue SET first_attempt_counted_at=now()
+		WHERE id=ANY($1) AND first_attempt_counted_at IS NULL
+	`, uncounted)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(uncounted)) {
+		return errors.New("account first-attempt counter state changed while locked")
+	}
+	return countTx.Commit(ctx)
 }
 
 func (s *Store) ClaimScheduledAccounts(

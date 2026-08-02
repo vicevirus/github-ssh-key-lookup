@@ -507,7 +507,7 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 				context.Background(), jobs, err,
 				retryDelay(err, maxJobAttempts(jobs)),
 			)
-			return err
+			return fmt.Errorf("persist first GraphQL account attempts: %w", err)
 		}
 		validJobs := make([]model.Candidate, 0, len(jobs))
 		validResults := make([]*model.UserResult, 0, len(jobs))
@@ -528,7 +528,7 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 				context.Background(), validJobs, err,
 				retryDelay(err, maxJobAttempts(validJobs)),
 			)
-			return err
+			return fmt.Errorf("commit GraphQL account results: %w", err)
 		}
 		if err := s.handleMissingAccounts(ctx, missingJobs); err != nil {
 			return err
@@ -1261,7 +1261,8 @@ func (s *Service) priorityOwners(ctx context.Context) error {
 				ctx, "owner", ownerQueueLimit,
 			)
 			if err != nil {
-				return err
+				s.workerError(ctx, worker, role, "failed to inspect owner refresh queue", err)
+				continue
 			}
 			if ownerDepth >= ownerQueueLimit {
 				continue
@@ -1270,7 +1271,7 @@ func (s *Service) priorityOwners(ctx context.Context) error {
 			inserted, err := s.Store.EnqueueDueOwners(ctx, limit)
 			if err != nil {
 				s.workerError(ctx, worker, role, "failed to enqueue owner refresh", err)
-				return err
+				continue
 			}
 			activity := "known-owner refresh queue is current"
 			if inserted > 0 {
@@ -1298,7 +1299,8 @@ func (s *Service) zeroKeyRechecks(ctx context.Context) error {
 				ctx, "live", liveQueueLimit,
 			)
 			if err != nil {
-				return err
+				s.workerError(ctx, worker, role, "failed to inspect zero-key recheck queue", err)
+				continue
 			}
 			if liveDepth >= liveQueueLimit {
 				continue
@@ -1307,7 +1309,7 @@ func (s *Service) zeroKeyRechecks(ctx context.Context) error {
 			inserted, err := s.Store.EnqueueDueZeroKeyRechecks(ctx, limit)
 			if err != nil {
 				s.workerError(ctx, worker, role, "failed to enqueue zero-key rechecks", err)
-				return err
+				continue
 			}
 			activity := "zero-key retry queue is current"
 			if inserted > 0 {
@@ -1332,7 +1334,8 @@ func (s *Service) retryAnomalies(ctx context.Context) error {
 		case <-ticker.C:
 			inserted, err := s.Store.EnqueueDueAnomalies(ctx, 100)
 			if err != nil {
-				return err
+				s.workerError(ctx, worker, role, "failed to enqueue anomaly retries", err)
+				continue
 			}
 			activity := "persistent anomaly queue is current"
 			if inserted > 0 {
@@ -1385,7 +1388,7 @@ func (s *Service) monitorRuns(ctx context.Context) error {
 			}
 			if time.Now().After(nextSnapshot) {
 				if err := s.Store.SaveRateSample(ctx); err != nil {
-					return err
+					s.Logger.Warn("persist rate sample failed", "error", err)
 				}
 				if err := s.Store.SaveStatusSnapshot(ctx); err != nil {
 					s.Logger.Warn("persist status snapshot failed", "error", err)
@@ -1394,7 +1397,7 @@ func (s *Service) monitorRuns(ctx context.Context) error {
 			}
 			if time.Now().After(nextLeaseReap) {
 				if _, err := s.Store.ReapExpiredLeases(ctx); err != nil {
-					return err
+					s.Logger.Warn("reap expired claims failed", "error", err)
 				}
 				nextLeaseReap = time.Now().Add(time.Minute)
 			}
