@@ -27,6 +27,7 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 				"estimated_finish_early": finish,
 				"estimated_finish_late":  finish.Add(time.Hour),
 				"basis":                  "active shard ranges and observed user density",
+				"rate_is_preliminary":    true,
 			},
 		},
 		"crawler": map[string]any{
@@ -73,6 +74,9 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	}
 	if progress["attempted_users"] != int64(750) || progress["attempt_rate_per_hour"] != 390.0 {
 		t.Fatalf("missing first-attempt progress: %#v", progress)
+	}
+	if progress["estimate_preliminary"] != true {
+		t.Fatalf("missing estimate warm-up state: %#v", progress)
 	}
 	passes := result["passes"].(map[string]any)
 	if passes["first"] == nil || passes["second"] == nil || result["usable"] != true {

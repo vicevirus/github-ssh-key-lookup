@@ -215,6 +215,7 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"estimated_finish_early":     estimate["estimated_finish_early"],
 			"estimated_finish_late":      estimate["estimated_finish_late"],
 			"estimate_basis":             estimate["basis"],
+			"estimate_preliminary":       estimate["rate_is_preliminary"],
 			"estimate_scope":             "first pass: REST discovery plus first GraphQL observation",
 		},
 		"passes": passes,
