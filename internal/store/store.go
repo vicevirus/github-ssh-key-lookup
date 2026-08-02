@@ -1492,10 +1492,10 @@ func (s *Store) ClaimScheduledAccounts(
 	limit int,
 	preferred string,
 ) ([]model.Candidate, error) {
-	// Claim one exact source at a time. A negative/fallback source predicate
-	// forces PostgreSQL to sort the entire multi-million-row global queue when
-	// the preferred class is empty, while equality can walk the due-source index
-	// and stop after the requested batch.
+	// Claim one exact source and status at a time. A negative/fallback source
+	// predicate forces PostgreSQL to sort the entire multi-million-row global
+	// queue when the preferred class is empty, while equality can walk the
+	// existing status/source index and stop after the requested batch.
 	sourceOrder := []string{
 		"anomaly", "reconcile", "global", "tail", "onboarding", "priority",
 	}
@@ -1515,15 +1515,21 @@ func (s *Store) ClaimScheduledAccounts(
 	}
 	defer tx.Rollback(ctx)
 	result := make([]model.Candidate, 0, limit)
-	for _, source := range sourceOrder {
-		if len(result) == limit {
-			break
+	// Retry is the outer loop so a recovered or failed observation cannot sit
+	// behind millions of never-attempted legacy pending rows.
+	for _, status := range []string{"retry", "pending"} {
+		for _, source := range sourceOrder {
+			if len(result) == limit {
+				break
+			}
+			claimed, err := claimAccountSourceStatus(
+				ctx, tx, limit-len(result), source, status,
+			)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, claimed...)
 		}
-		claimed, err := claimAccountSource(ctx, tx, limit-len(result), source)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, claimed...)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -1532,20 +1538,21 @@ func (s *Store) ClaimScheduledAccounts(
 	return result, nil
 }
 
-func claimAccountSource(
+func claimAccountSourceStatus(
 	ctx context.Context,
 	tx pgx.Tx,
 	limit int,
 	source string,
+	status string,
 ) ([]model.Candidate, error) {
 	rows, err := tx.Query(ctx, `
 		WITH picked AS (
 		  SELECT id
 		  FROM account_queue
-		  WHERE status IN ('pending', 'retry')
+		  WHERE status = $3
 		    AND next_attempt_at <= now()
 		    AND source = $2
-		  ORDER BY next_attempt_at, id
+		  ORDER BY id
 		  FOR UPDATE SKIP LOCKED
 		  LIMIT $1
 		)
@@ -1560,7 +1567,7 @@ func claimAccountSource(
 		          q.node_id, q.login, q.scan_id::text, q.attempts,
 		          q.claim_token::text, q.coverage_generation_id,
 		          q.coverage_partition_id
-	`, limit, source)
+	`, limit, source, status)
 	if err != nil {
 		return nil, err
 	}

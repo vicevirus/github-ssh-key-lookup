@@ -368,6 +368,41 @@ func TestClaimLeasesRejectStaleWorkersAndHonorRetryDueTime(t *testing.T) {
 	}
 }
 
+func TestDueRetryPrecedesPendingWork(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	retryCandidate := model.Candidate{GitHubID: 78, NodeID: "U_78", Login: "retry-first"}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{retryCandidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("initial claim: jobs=%#v err=%v", jobs, err)
+	}
+	if err := database.RequeueAccountsAfter(
+		ctx, jobs, errors.New("retry me"), time.Hour,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue SET next_attempt_at=now()-interval '1 second'
+		WHERE github_id=$1
+	`, retryCandidate.GitHubID); err != nil {
+		t.Fatal(err)
+	}
+	pending := model.Candidate{GitHubID: 79, NodeID: "U_79", Login: "pending-second"}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{pending}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].GitHubID != retryCandidate.GitHubID {
+		t.Fatalf("pending work jumped ahead of a due retry: %#v", jobs)
+	}
+}
+
 func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
