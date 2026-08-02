@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -1755,6 +1756,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		"remaining": 0,
 		"ranges":    []map[string]any{},
 	}
+	var remainingShardIDs, observedShardIDs, observedShardUsers int64
 	if len(runs) > 0 {
 		shardRows, err := s.Pool.Query(ctx, `
 			SELECT id, lower_id, upper_id, next_since_id, status,
@@ -1784,6 +1786,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				completed++
 			} else {
 				remaining++
+				observedShardIDs += max(int64(0), nextSince-lowerID)
+				observedShardUsers += enumerated
+				remainingShardIDs += max(int64(0), upperID-nextSince)
 			}
 			ranges = append(ranges, map[string]any{
 				"id": id, "lower_id": lowerID, "upper_id": upperID,
@@ -1913,6 +1918,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var sessionStartedAt *time.Time
 	var sessionLastSuccessAt *time.Time
 	var sessionProcessedUsers int64
+	var enumerationStartedAt *time.Time
+	var enumerationLastSuccessAt *time.Time
+	var enumerationProcessedUsers int64
 	for index := range workers {
 		worker := workers[index]
 		if latestHeartbeat == nil || worker.HeartbeatAt.After(*latestHeartbeat) {
@@ -1929,18 +1937,29 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				staleWorkers++
 			}
 		}
-		if worker.Role != "SSH key batch worker" {
-			continue
-		}
-		sessionProcessedUsers += worker.ProcessedUsers
-		if sessionStartedAt == nil || worker.StartedAt.Before(*sessionStartedAt) {
-			value := worker.StartedAt
-			sessionStartedAt = &value
-		}
-		if worker.LastSuccessAt != nil &&
-			(sessionLastSuccessAt == nil || worker.LastSuccessAt.After(*sessionLastSuccessAt)) {
-			value := *worker.LastSuccessAt
-			sessionLastSuccessAt = &value
+		switch worker.Role {
+		case "SSH key batch worker":
+			sessionProcessedUsers += worker.ProcessedUsers
+			if sessionStartedAt == nil || worker.StartedAt.Before(*sessionStartedAt) {
+				value := worker.StartedAt
+				sessionStartedAt = &value
+			}
+			if worker.LastSuccessAt != nil &&
+				(sessionLastSuccessAt == nil || worker.LastSuccessAt.After(*sessionLastSuccessAt)) {
+				value := *worker.LastSuccessAt
+				sessionLastSuccessAt = &value
+			}
+		case "parallel global account enumeration":
+			enumerationProcessedUsers += worker.ProcessedUsers
+			if enumerationStartedAt == nil || worker.StartedAt.Before(*enumerationStartedAt) {
+				value := worker.StartedAt
+				enumerationStartedAt = &value
+			}
+			if worker.LastSuccessAt != nil &&
+				(enumerationLastSuccessAt == nil || worker.LastSuccessAt.After(*enumerationLastSuccessAt)) {
+				value := *worker.LastSuccessAt
+				enumerationLastSuccessAt = &value
+			}
 		}
 	}
 	var sessionUsersPerHour float64
@@ -1949,6 +1968,13 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		sessionLastSuccessAt.After(*sessionStartedAt) {
 		sessionElapsedHours = sessionLastSuccessAt.Sub(*sessionStartedAt).Hours()
 		sessionUsersPerHour = float64(sessionProcessedUsers) / sessionElapsedHours
+	}
+	var enumerationUsersPerHour float64
+	var enumerationElapsedHours float64
+	if enumerationStartedAt != nil && enumerationLastSuccessAt != nil &&
+		enumerationLastSuccessAt.After(*enumerationStartedAt) {
+		enumerationElapsedHours = enumerationLastSuccessAt.Sub(*enumerationStartedAt).Hours()
+		enumerationUsersPerHour = float64(enumerationProcessedUsers) / enumerationElapsedHours
 	}
 	highwater, _ := s.StateInt(ctx, "tail_highwater")
 	initialComplete, _ := s.State(ctx, "initial_complete")
@@ -1976,6 +2002,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		progress["run_id"] = active.ID
 		progress["enumerated_users"] = active.EnumeratedUsers
 		progress["processed_users"] = active.ProcessedUsers
+		progress["processing_backlog"] = max(
+			int64(0), active.EnumeratedUsers-active.ProcessedUsers,
+		)
 		progress["checkpoint_user_id"] = active.NextSinceID
 		progress["enumeration_complete"] = active.EnumerationComplete
 		elapsed := time.Since(active.StartedAt).Hours()
@@ -1989,6 +2018,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				progress["current_session_users_per_hour"] = sessionUsersPerHour
 				progress["current_session_elapsed_hours"] = sessionElapsedHours
 			}
+			if enumerationUsersPerHour > 0 {
+				progress["current_enumeration_users_per_hour"] = enumerationUsersPerHour
+				progress["current_enumeration_elapsed_hours"] = enumerationElapsedHours
+			}
 			etaRate := sessionUsersPerHour
 			rateBasis := "current crawler session, including throttling and cooldowns during that session"
 			if etaRate <= 0 {
@@ -1998,15 +2031,39 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			if etaRate > 0 {
 				lowTotal, highTotal := estimatedLow, estimatedHigh
 				basis := "planning population envelope"
-				if active.EnumerationComplete && active.EnumeratedUsers > 0 {
-					lowTotal = active.EnumeratedUsers
-					highTotal = active.EnumeratedUsers
-					basis = "exact users enumerated for this run"
-				}
 				lowRemaining := max(int64(0), lowTotal-active.ProcessedUsers)
 				highRemaining := max(int64(0), highTotal-active.ProcessedUsers)
 				lowHours := float64(lowRemaining) / etaRate
 				highHours := float64(highRemaining) / etaRate
+				if active.EnumerationComplete && active.EnumeratedUsers > 0 {
+					lowTotal = active.EnumeratedUsers
+					highTotal = active.EnumeratedUsers
+					basis = "exact users enumerated for this run"
+					lowRemaining = max(int64(0), lowTotal-active.ProcessedUsers)
+					highRemaining = lowRemaining
+					lowHours = float64(lowRemaining) / etaRate
+					highHours = lowHours
+				} else if remainingShardIDs > 0 && observedShardIDs > 0 &&
+					enumerationUsersPerHour > 0 {
+					density := float64(observedShardUsers) / float64(observedShardIDs)
+					density = math.Max(0, math.Min(1, density))
+					estimatedFutureUsers := int64(math.Ceil(float64(remainingShardIDs) * density))
+					backlog := max(int64(0), active.EnumeratedUsers-active.ProcessedUsers)
+					lowTotal = active.EnumeratedUsers + estimatedFutureUsers
+					highTotal = active.EnumeratedUsers + remainingShardIDs
+					lowRemaining = backlog + estimatedFutureUsers
+					highRemaining = backlog + remainingShardIDs
+					enumerationHours := float64(estimatedFutureUsers) / enumerationUsersPerHour
+					conservativeEnumerationHours := float64(remainingShardIDs) / enumerationUsersPerHour
+					lowHours = math.Max(float64(lowRemaining)/etaRate, enumerationHours)
+					highHours = math.Max(float64(highRemaining)/etaRate, conservativeEnumerationHours)
+					basis = "active shard ranges and observed user density"
+					rateBasis = "current GraphQL processing and REST enumeration sessions"
+					progress["remaining_id_positions"] = remainingShardIDs
+					progress["observed_users_per_id"] = density
+					progress["estimated_future_users"] = estimatedFutureUsers
+					progress["processing_backlog"] = backlog
+				}
 				progress["estimated_completion"] = map[string]any{
 					"basis":                  basis,
 					"rate_basis":             rateBasis,

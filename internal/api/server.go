@@ -137,10 +137,7 @@ func (s *Server) writeStatusSnapshot(
 	fetched time.Time,
 	stale bool,
 ) {
-	body := make(map[string]any, len(snapshot)+1)
-	for key, value := range snapshot {
-		body[key] = value
-	}
+	body := compactStatusSnapshot(snapshot)
 	age := time.Since(fetched)
 	if age < 0 {
 		age = 0
@@ -157,6 +154,56 @@ func (s *Server) writeStatusSnapshot(
 	)
 	response.Header().Set("X-Status-Snapshot-At", fetched.UTC().Format(time.RFC3339Nano))
 	writeJSON(response, http.StatusOK, body)
+}
+
+func compactStatusSnapshot(snapshot map[string]any) map[string]any {
+	index, _ := snapshot["index"].(map[string]int64)
+	progress, _ := snapshot["progress"].(map[string]any)
+	crawler, _ := snapshot["crawler"].(map[string]any)
+	coverage, _ := snapshot["coverage"].(map[string]any)
+	recovery, _ := snapshot["recovery"].(map[string]any)
+	estimate, _ := progress["estimated_completion"].(map[string]any)
+
+	state := "offline"
+	if online, _ := crawler["online"].(bool); online {
+		state = "running"
+	}
+	var runErrors int64
+	if runs, ok := snapshot["runs"].([]store.Run); ok && len(runs) > 0 {
+		runErrors = runs[0].ErrorUsers
+	}
+	return map[string]any{
+		"status": state,
+		"crawler": map[string]any{
+			"online":            crawler["online"],
+			"phase":             progress["phase"],
+			"active_workers":    crawler["active_workers"],
+			"last_heartbeat_at": crawler["last_heartbeat_at"],
+		},
+		"index": map[string]any{
+			"owners": index["owners"],
+			"keys":   index["keys"],
+		},
+		"progress": map[string]any{
+			"enumerated_users":           progress["enumerated_users"],
+			"processed_users":            progress["processed_users"],
+			"queued_users":               progress["processing_backlog"],
+			"enumeration_complete":       progress["enumeration_complete"],
+			"remaining_id_positions":     progress["remaining_id_positions"],
+			"processing_users_per_hour":  estimate["rate_users_per_hour"],
+			"enumeration_users_per_hour": progress["current_enumeration_users_per_hour"],
+			"estimated_finish_early":     estimate["estimated_finish_early"],
+			"estimated_finish_late":      estimate["estimated_finish_late"],
+			"estimate_basis":             estimate["basis"],
+		},
+		"coverage": map[string]any{
+			"initial_complete": coverage["initial_complete"],
+		},
+		"errors": map[string]any{
+			"run_errors":    runErrors,
+			"retrying_jobs": recovery["retrying_jobs"],
+		},
+	}
 }
 
 func (s *Server) users(response http.ResponseWriter, request *http.Request) {

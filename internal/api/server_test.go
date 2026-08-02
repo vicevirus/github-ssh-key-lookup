@@ -7,7 +7,55 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/local/github-ssh-index/internal/store"
 )
+
+func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
+	finish := time.Now().Add(24 * time.Hour)
+	snapshot := map[string]any{
+		"index": map[string]int64{"owners": 12, "keys": 34, "associations": 56},
+		"progress": map[string]any{
+			"phase": "initial_scan", "enumerated_users": int64(1000),
+			"processed_users": int64(700), "processing_backlog": int64(300),
+			"enumeration_complete": false, "remaining_id_positions": int64(500),
+			"current_enumeration_users_per_hour": 400.0,
+			"estimated_completion": map[string]any{
+				"rate_users_per_hour":    390.0,
+				"estimated_finish_early": finish,
+				"estimated_finish_late":  finish.Add(time.Hour),
+				"basis":                  "active shard ranges and observed user density",
+			},
+		},
+		"crawler": map[string]any{
+			"online": true, "active_workers": 9,
+			"last_heartbeat_at": time.Now(),
+		},
+		"coverage": map[string]any{"initial_complete": false},
+		"recovery": map[string]any{"retrying_jobs": int64(0)},
+		"runs":     []store.Run{{ErrorUsers: 2}},
+		"workers":  []store.WorkerStatus{{Name: "internal-worker"}},
+		"pacing":   map[string]any{"graphql": "internal"},
+	}
+
+	result := compactStatusSnapshot(snapshot)
+	for _, internal := range []string{"workers", "runs", "pacing", "scheduler", "enumeration", "recovery"} {
+		if _, exists := result[internal]; exists {
+			t.Fatalf("compact status exposed %q", internal)
+		}
+	}
+	if result["status"] != "running" {
+		t.Fatalf("unexpected status: %#v", result)
+	}
+	progress := result["progress"].(map[string]any)
+	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {
+		t.Fatalf("missing compact progress: %#v", progress)
+	}
+	errors := result["errors"].(map[string]any)
+	if errors["run_errors"] != int64(2) {
+		t.Fatalf("missing run errors: %#v", errors)
+	}
+}
 
 func TestParsePaginationDefaultsAndBounds(t *testing.T) {
 	page, err := parsePagination(url.Values{})
