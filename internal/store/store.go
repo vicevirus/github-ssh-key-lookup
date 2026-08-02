@@ -1125,7 +1125,10 @@ func lockCrawlRuns(ctx context.Context, tx pgx.Tx, runIDs []int64) error {
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
 	_, err := tx.Exec(ctx, `
-		SELECT id FROM crawl_runs WHERE id = ANY($1) ORDER BY id FOR UPDATE
+		SELECT id FROM crawl_runs
+		WHERE id = ANY($1)
+		ORDER BY id
+		FOR NO KEY UPDATE
 	`, ordered)
 	return err
 }

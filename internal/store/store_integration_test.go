@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/local/github-ssh-index/internal/model"
@@ -459,6 +460,46 @@ func TestMarkAccountsAttemptedIsDurableAndIdempotent(t *testing.T) {
 			"attempt progress was not persisted exactly once: count=%d observed=%v counted=%v",
 			attempted, firstAttemptedAt, firstAttemptCountedAt,
 		)
+	}
+}
+
+func TestRunCounterLockDoesNotConflictWithQueueForeignKeys(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	var runID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO crawl_runs (kind, next_since_id, next_url)
+		VALUES ('initial', 0, 'https://api.github.com/users?since=0')
+		RETURNING id
+	`).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := database.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback(ctx)
+	second, err := database.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Rollback(ctx)
+	for index, tx := range []pgx.Tx{first, second} {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO account_queue (
+			  run_id, source, github_id, node_id, login
+			) VALUES ($1, 'global', $2, $3, $4)
+		`, runID, 100+index, "U_"+strconv.Itoa(100+index),
+			"queued-"+strconv.Itoa(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The second transaction now holds a foreign-key KEY SHARE lock on the run.
+	// A FOR UPDATE counter lock deadlocks here; NO KEY UPDATE is compatible.
+	lockContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := lockCrawlRuns(lockContext, first, []int64{runID}); err != nil {
+		t.Fatalf("run counter lock conflicted with queue foreign key: %v", err)
 	}
 }
 
