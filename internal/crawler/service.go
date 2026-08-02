@@ -502,6 +502,13 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			s.Logger.Error("invalid GitHub key response", "error", err)
 			continue
 		}
+		if err := s.Store.MarkAccountsAttempted(ctx, jobs); err != nil {
+			_ = s.Store.RequeueAccountsAfter(
+				context.Background(), jobs, err,
+				retryDelay(err, maxJobAttempts(jobs)),
+			)
+			return err
+		}
 		validJobs := make([]model.Candidate, 0, len(jobs))
 		validResults := make([]*model.UserResult, 0, len(jobs))
 		missingJobs := make([]model.Candidate, 0)
@@ -534,10 +541,11 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		}
 		s.workerRequest(
 			ctx, worker, role, "indexed SSH key batch", response.Rate,
-			len(validJobs), keyCount,
+			len(jobs), keyCount,
 		)
 		s.Logger.Info("indexed GraphQL batch",
-			"worker", workerID, "users", len(validJobs), "keys", keyCount,
+			"worker", workerID, "requested_users", len(jobs),
+			"users", len(validJobs), "keys", keyCount,
 			"cost", response.Rate.Cost, "remaining", response.Rate.Remaining,
 			"latency", response.Elapsed)
 	}

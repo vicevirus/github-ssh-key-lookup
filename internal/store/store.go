@@ -35,6 +35,7 @@ type Run struct {
 	NextURL              string     `json:"next_url"`
 	EnumerationComplete  bool       `json:"enumeration_complete"`
 	EnumeratedUsers      int64      `json:"enumerated_users"`
+	AttemptedUsers       int64      `json:"attempted_users"`
 	ProcessedUsers       int64      `json:"processed_users"`
 	ZeroKeyUsers         int64      `json:"zero_key_users"`
 	KeyOwnerUsers        int64      `json:"key_owner_users"`
@@ -1046,7 +1047,7 @@ func (s *Store) EnsureMainRun(ctx context.Context, initialURL string) (Run, erro
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, kind, status, cutoff_user_id, next_since_id,
 		          next_url, enumeration_complete, enumerated_users,
-		          processed_users, zero_key_users, key_owner_users,
+		          attempted_users, processed_users, zero_key_users, key_owner_users,
 		          inaccessible_users, error_users, coverage_version,
 		          coverage_generation_id, settled_cutoff, started_at, completed_at
 	`, kind, cutoff, initialURL, coverageVersion, settledCutoff)
@@ -1081,7 +1082,7 @@ func (s *Store) ActiveMainRun(ctx context.Context) (Run, error) {
 	return scanRun(s.Pool.QueryRow(ctx, `
 		SELECT id, kind, status, cutoff_user_id, next_since_id,
 		       next_url, enumeration_complete, enumerated_users,
-		       processed_users, zero_key_users, key_owner_users,
+		       attempted_users, processed_users, zero_key_users, key_owner_users,
 		       inaccessible_users, error_users, coverage_version,
 		       coverage_generation_id, settled_cutoff, started_at, completed_at
 		FROM crawl_runs
@@ -1100,7 +1101,7 @@ func scanRun(row rowScanner) (Run, error) {
 	err := row.Scan(
 		&run.ID, &run.Kind, &run.Status, &run.CutoffUserID,
 		&run.NextSinceID, &run.NextURL, &run.EnumerationComplete,
-		&run.EnumeratedUsers, &run.ProcessedUsers,
+		&run.EnumeratedUsers, &run.AttemptedUsers, &run.ProcessedUsers,
 		&run.ZeroKeyUsers, &run.KeyOwnerUsers, &run.InaccessibleUsers,
 		&run.ErrorUsers, &run.CoverageVersion, &run.CoverageGenerationID,
 		&run.SettledCutoff,
@@ -1485,6 +1486,99 @@ func (s *Store) ClaimAccounts(ctx context.Context, limit int, preferPriority boo
 		preferred = "owner"
 	}
 	return s.ClaimScheduledAccounts(ctx, limit, preferred)
+}
+
+// MarkAccountsAttempted records the first successful GraphQL observation for
+// each claimed queue item. It is transactional and idempotent so a database
+// failure or crawler restart cannot double-count first-pass progress.
+func (s *Store) MarkAccountsAttempted(
+	ctx context.Context, jobs []model.Candidate,
+) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	queueIDs := make([]int64, len(jobs))
+	claimTokens := make([]string, len(jobs))
+	for index, job := range jobs {
+		if job.QueueID <= 0 || job.ClaimToken == "" {
+			return errors.New("attempted account has no durable queue claim")
+		}
+		queueIDs[index] = job.QueueID
+		claimTokens[index] = job.ClaimToken
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `
+		SELECT queue.id, queue.run_id, queue.first_attempted_at
+		FROM account_queue AS queue
+		JOIN unnest($1::bigint[], $2::text[]) AS claim(id, token)
+		  ON claim.id=queue.id AND claim.token=queue.claim_token::text
+		FOR UPDATE OF queue
+	`, queueIDs, claimTokens)
+	if err != nil {
+		return err
+	}
+	unmarked := make([]int64, 0, len(jobs))
+	runCounts := make(map[int64]int64)
+	matched := 0
+	for rows.Next() {
+		var queueID int64
+		var runID *int64
+		var attemptedAt *time.Time
+		if err := rows.Scan(&queueID, &runID, &attemptedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		matched++
+		if attemptedAt != nil {
+			continue
+		}
+		unmarked = append(unmarked, queueID)
+		if runID != nil {
+			runCounts[*runID]++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if matched != len(jobs) {
+		return fmt.Errorf("stale account claims while marking attempts: matched %d of %d", matched, len(jobs))
+	}
+	if len(unmarked) == 0 {
+		return tx.Commit(ctx)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE account_queue SET first_attempted_at=now()
+		WHERE id=ANY($1) AND first_attempted_at IS NULL
+	`, unmarked)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(unmarked)) {
+		return errors.New("account first-attempt state changed while locked")
+	}
+	runIDs := make([]int64, 0, len(runCounts))
+	for runID := range runCounts {
+		runIDs = append(runIDs, runID)
+	}
+	if err := lockCrawlRuns(ctx, tx, runIDs); err != nil {
+		return err
+	}
+	for runID, count := range runCounts {
+		if _, err := tx.Exec(ctx, `
+			UPDATE crawl_runs
+			SET attempted_users=LEAST(enumerated_users, attempted_users+$2)
+			WHERE id=$1
+		`, runID, count); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ClaimScheduledAccounts(
@@ -3246,14 +3340,16 @@ func (s *Store) LoadStatusSnapshot(
 func (s *Store) SaveRateSample(ctx context.Context) error {
 	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO crawler_rate_samples (
-		  sampled_at, processed_users, enumerated_users
+		  sampled_at, processed_users, attempted_users, enumerated_users
 		)
 		SELECT date_trunc('minute', now()),
 		       COALESCE(SUM(processed_users), 0),
+		       COALESCE(SUM(attempted_users), 0),
 		       COALESCE(SUM(enumerated_users), 0)
 		FROM crawl_runs
 		ON CONFLICT (sampled_at) DO UPDATE SET
 		  processed_users=excluded.processed_users,
+		  attempted_users=excluded.attempted_users,
 		  enumerated_users=excluded.enumerated_users;
 		DELETE FROM crawler_rate_samples
 		WHERE sampled_at < now() - interval '7 days'
@@ -3475,7 +3571,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, kind, status, cutoff_user_id, next_since_id,
 		       next_url, enumeration_complete, enumerated_users,
-		       processed_users, zero_key_users, key_owner_users,
+		       attempted_users, processed_users, zero_key_users, key_owner_users,
 		       inaccessible_users, error_users, coverage_version,
 		       coverage_generation_id, settled_cutoff, started_at, completed_at
 		FROM crawl_runs ORDER BY id DESC LIMIT 10
@@ -3723,25 +3819,37 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		enumerationUsersPerHour = float64(enumerationProcessedUsers) / enumerationElapsedHours
 	}
 	var rollingOneHour, rollingSixHours float64
+	var rollingOneHourAttempts, rollingSixHourAttempts float64
 	if err := s.Pool.QueryRow(ctx, `
 		WITH one_hour AS (
 		  SELECT MIN(sampled_at) AS first_at, MAX(sampled_at) AS last_at,
 		         MIN(processed_users) AS first_value,
-		         MAX(processed_users) AS last_value
+		         MAX(processed_users) AS last_value,
+		         MIN(attempted_users) AS first_attempted,
+		         MAX(attempted_users) AS last_attempted
 		  FROM crawler_rate_samples WHERE sampled_at >= now()-interval '1 hour'
 		), six_hours AS (
 		  SELECT MIN(sampled_at) AS first_at, MAX(sampled_at) AS last_at,
 		         MIN(processed_users) AS first_value,
-		         MAX(processed_users) AS last_value
+		         MAX(processed_users) AS last_value,
+		         MIN(attempted_users) AS first_attempted,
+		         MAX(attempted_users) AS last_attempted
 		  FROM crawler_rate_samples WHERE sampled_at >= now()-interval '6 hours'
 		)
 		SELECT
 		  COALESCE((one_hour.last_value-one_hour.first_value) /
 		    NULLIF(EXTRACT(epoch FROM one_hour.last_at-one_hour.first_at)/3600.0, 0), 0),
 		  COALESCE((six_hours.last_value-six_hours.first_value) /
+		    NULLIF(EXTRACT(epoch FROM six_hours.last_at-six_hours.first_at)/3600.0, 0), 0),
+		  COALESCE((one_hour.last_attempted-one_hour.first_attempted) /
+		    NULLIF(EXTRACT(epoch FROM one_hour.last_at-one_hour.first_at)/3600.0, 0), 0),
+		  COALESCE((six_hours.last_attempted-six_hours.first_attempted) /
 		    NULLIF(EXTRACT(epoch FROM six_hours.last_at-six_hours.first_at)/3600.0, 0), 0)
 		FROM one_hour, six_hours
-	`).Scan(&rollingOneHour, &rollingSixHours); err != nil {
+	`).Scan(
+		&rollingOneHour, &rollingSixHours,
+		&rollingOneHourAttempts, &rollingSixHourAttempts,
+	); err != nil {
 		return nil, err
 	}
 	highwater, _ := s.StateInt(ctx, "tail_highwater")
@@ -3760,8 +3868,18 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		"percentage":                nil,
 		"percentage_available_when": "account enumeration for the active run is complete",
 	}
+	firstPassStatus := map[string]any{
+		"status":                    "starting",
+		"complete":                  false,
+		"settled":                   false,
+		"positive_lookups_usable":   keys > 0,
+		"negative_lookups_complete": false,
+	}
 	if len(runs) > 0 {
 		active := runs[0]
+		attemptedUsers := max(active.AttemptedUsers, active.ProcessedUsers)
+		unattemptedBacklog := max(int64(0), active.EnumeratedUsers-attemptedUsers)
+		settlementBacklog := max(int64(0), active.EnumeratedUsers-active.ProcessedUsers)
 		if active.Status == "running" {
 			progress["phase"] = active.Kind + "_scan"
 		} else {
@@ -3769,21 +3887,34 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		}
 		progress["run_id"] = active.ID
 		progress["enumerated_users"] = active.EnumeratedUsers
+		progress["attempted_users"] = attemptedUsers
 		progress["processed_users"] = active.ProcessedUsers
-		progress["processing_backlog"] = max(
-			int64(0), active.EnumeratedUsers-active.ProcessedUsers,
-		)
+		progress["first_pass_backlog"] = unattemptedBacklog
+		progress["processing_backlog"] = settlementBacklog
 		progress["checkpoint_user_id"] = active.NextSinceID
 		progress["enumeration_complete"] = active.EnumerationComplete
+		firstPassStatus["status"] = "running"
+		firstPassStatus["discovery_complete"] = active.EnumerationComplete
+		firstPassStatus["discovered_users"] = active.EnumeratedUsers
+		firstPassStatus["attempted_users"] = attemptedUsers
+		firstPassStatus["settled_users"] = active.ProcessedUsers
+		firstPassStatus["unattempted_discovered_users"] = unattemptedBacklog
+		firstPassStatus["unsettled_users"] = settlementBacklog
+		firstPassStatus["complete"] = active.EnumerationComplete &&
+			attemptedUsers >= active.EnumeratedUsers
+		firstPassStatus["settled"] = active.EnumerationComplete &&
+			active.ProcessedUsers >= active.EnumeratedUsers
 		elapsed := time.Since(active.StartedAt).Hours()
 		if active.CompletedAt != nil {
 			elapsed = active.CompletedAt.Sub(active.StartedAt).Hours()
 		}
 		if elapsed > 0 {
 			wallClockAverage := float64(active.ProcessedUsers) / elapsed
+			wallClockAttemptAverage := float64(attemptedUsers) / elapsed
 			progress["wall_clock_users_per_hour"] = wallClockAverage
+			progress["wall_clock_attempts_per_hour"] = wallClockAttemptAverage
 			if sessionUsersPerHour > 0 {
-				progress["current_session_users_per_hour"] = sessionUsersPerHour
+				progress["current_session_attempts_per_hour"] = sessionUsersPerHour
 				progress["current_session_elapsed_hours"] = sessionElapsedHours
 			}
 			if enumerationUsersPerHour > 0 {
@@ -3792,58 +3923,63 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			}
 			progress["rolling_1h_users_per_hour"] = rollingOneHour
 			progress["rolling_6h_users_per_hour"] = rollingSixHours
+			progress["rolling_1h_attempts_per_hour"] = rollingOneHourAttempts
+			progress["rolling_6h_attempts_per_hour"] = rollingSixHourAttempts
 			etaRate := sessionUsersPerHour
-			rateBasis := "current crawler session, including throttling and cooldowns during that session"
-			if rollingOneHour > 0 {
-				etaRate = rollingOneHour
-				rateBasis = "persisted rolling one-hour processing rate across restarts"
-			} else if rollingSixHours > 0 {
-				etaRate = rollingSixHours
-				rateBasis = "persisted rolling six-hour processing rate across restarts"
+			rateBasis := "current GraphQL account-attempt rate"
+			if rollingOneHourAttempts > 0 {
+				etaRate = rollingOneHourAttempts
+				rateBasis = "persisted rolling one-hour account-attempt rate"
+			} else if rollingSixHourAttempts > 0 {
+				etaRate = rollingSixHourAttempts
+				rateBasis = "persisted rolling six-hour account-attempt rate"
 			}
 			if etaRate <= 0 {
-				etaRate = wallClockAverage
-				rateBasis = "wall-clock average since run start, including downtime and throttling"
+				etaRate = wallClockAttemptAverage
+				rateBasis = "wall-clock account-attempt average since run start"
+			}
+			if etaRate <= 0 {
+				etaRate = rollingOneHour
+				rateBasis = "settled-account rate until attempt samples are available"
 			}
 			if etaRate > 0 {
 				lowTotal, highTotal := estimatedLow, estimatedHigh
 				basis := "planning population envelope"
-				lowRemaining := max(int64(0), lowTotal-active.ProcessedUsers)
-				highRemaining := max(int64(0), highTotal-active.ProcessedUsers)
+				lowRemaining := max(int64(0), lowTotal-attemptedUsers)
+				highRemaining := max(int64(0), highTotal-attemptedUsers)
 				lowHours := float64(lowRemaining) / etaRate
 				highHours := float64(highRemaining) / etaRate
 				if active.EnumerationComplete && active.EnumeratedUsers > 0 {
 					lowTotal = active.EnumeratedUsers
 					highTotal = active.EnumeratedUsers
 					basis = "exact users enumerated for this run"
-					lowRemaining = max(int64(0), lowTotal-active.ProcessedUsers)
+					lowRemaining = max(int64(0), lowTotal-attemptedUsers)
 					highRemaining = lowRemaining
 					lowHours = float64(lowRemaining) / etaRate
 					highHours = lowHours
-				} else if remainingShardIDs > 0 && observedShardIDs > 0 &&
-					enumerationUsersPerHour > 0 {
+				} else if remainingShardIDs > 0 && observedShardIDs > 0 {
 					density := float64(observedShardUsers) / float64(observedShardIDs)
 					density = math.Max(0, math.Min(1, density))
 					estimatedFutureUsers := int64(math.Ceil(float64(remainingShardIDs) * density))
-					backlog := max(int64(0), active.EnumeratedUsers-active.ProcessedUsers)
 					lowTotal = active.EnumeratedUsers + estimatedFutureUsers
 					highTotal = active.EnumeratedUsers + remainingShardIDs
-					lowRemaining = backlog + estimatedFutureUsers
-					highRemaining = backlog + remainingShardIDs
-					enumerationHours := float64(estimatedFutureUsers) / enumerationUsersPerHour
-					conservativeEnumerationHours := float64(remainingShardIDs) / enumerationUsersPerHour
-					lowHours = math.Max(float64(lowRemaining)/etaRate, enumerationHours)
-					highHours = math.Max(float64(highRemaining)/etaRate, conservativeEnumerationHours)
+					lowRemaining = unattemptedBacklog + estimatedFutureUsers
+					highRemaining = unattemptedBacklog + remainingShardIDs
+					lowHours = float64(lowRemaining) / etaRate
+					highHours = float64(highRemaining) / etaRate
+					if enumerationUsersPerHour > 0 {
+						lowHours = math.Max(lowHours, float64(estimatedFutureUsers)/enumerationUsersPerHour)
+						highHours = math.Max(highHours, float64(remainingShardIDs)/enumerationUsersPerHour)
+					}
 					basis = "active shard ranges and observed user density"
-					rateBasis = "current GraphQL processing and REST enumeration sessions"
 					progress["remaining_id_positions"] = remainingShardIDs
 					progress["observed_users_per_id"] = density
 					progress["estimated_future_users"] = estimatedFutureUsers
-					progress["processing_backlog"] = backlog
 				}
-				progress["estimated_completion"] = map[string]any{
+				estimate := map[string]any{
 					"basis":                  basis,
 					"rate_basis":             rateBasis,
+					"rate_accounts_per_hour": etaRate,
 					"rate_users_per_hour":    etaRate,
 					"rate_is_preliminary":    sessionElapsedHours > 0 && sessionElapsedHours < 6,
 					"paused":                 activeWorkers == 0,
@@ -3855,15 +3991,33 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 					"estimated_finish_late":  now.Add(time.Duration(highHours * float64(time.Hour))),
 					"exact":                  basis == "exact users enumerated for this run",
 				}
+				progress["estimated_completion"] = estimate
+				firstPassStatus["estimated_undiscovered_users"] = max(
+					int64(0), lowTotal-active.EnumeratedUsers,
+				)
+				firstPassStatus["estimated_undiscovered_users_high"] = max(
+					int64(0), highTotal-active.EnumeratedUsers,
+				)
+				firstPassStatus["estimated_total_users_low"] = lowTotal
+				firstPassStatus["estimated_total_users_high"] = highTotal
+				firstPassStatus["estimated_remaining_observations_low"] = lowRemaining
+				firstPassStatus["estimated_remaining_observations_high"] = highRemaining
+				firstPassStatus["attempt_rate_per_hour"] = etaRate
+				firstPassStatus["estimated_finish_early"] = estimate["estimated_finish_early"]
+				firstPassStatus["estimated_finish_late"] = estimate["estimated_finish_late"]
+				firstPassStatus["estimate_basis"] = basis
 			}
 		}
 		if active.EnumerationComplete && active.EnumeratedUsers > 0 {
-			percentage := 100 * float64(active.ProcessedUsers) / float64(active.EnumeratedUsers)
+			percentage := 100 * float64(attemptedUsers) / float64(active.EnumeratedUsers)
 			if percentage > 100 {
 				percentage = 100
 			}
 			progress["percentage"] = percentage
 			delete(progress, "percentage_available_when")
+		}
+		if complete, _ := firstPassStatus["complete"].(bool); complete {
+			firstPassStatus["status"] = "complete"
 		}
 	}
 	recoveryState := "healthy"
@@ -4017,6 +4171,43 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
+	secondPassComplete, _ := coverageStatus["audit_complete"].(bool)
+	secondPassState := "waiting_for_first_pass"
+	if initialComplete == "true" {
+		secondPassState = "running"
+		if secondPassComplete {
+			secondPassState = "complete"
+		}
+	}
+	var secondPassPercentage any
+	if audit.DaysTotal > 0 {
+		secondPassPercentage = 100 * float64(audit.DaysComplete) / float64(audit.DaysTotal)
+	}
+	secondPassStatus := map[string]any{
+		"status":                secondPassState,
+		"complete":              secondPassComplete,
+		"purpose":               "independent creation-date coverage verification and repair",
+		"audit_days_complete":   audit.DaysComplete,
+		"audit_days_total":      audit.DaysTotal,
+		"percentage":            secondPassPercentage,
+		"audited_through":       coverageStatus["audited_through"],
+		"verification_state":    coverageStatus["verification_state"],
+		"estimated_finish":      nil,
+		"estimate_availability": "available after the second pass is actively producing rate samples",
+	}
+	if generationStatus := coverageStatus["generation_status"]; generationStatus != nil {
+		secondPassStatus["generation_status"] = generationStatus
+		secondPassStatus["discovered_accounts"] = coverageStatus["discovered_accounts"]
+		secondPassStatus["successful_accounts"] = coverageStatus["successful_accounts"]
+		secondPassStatus["inaccessible_accounts"] = coverageStatus["inaccessible_accounts"]
+		secondPassStatus["unresolved_accounts"] = coverageStatus["unresolved_accounts"]
+		secondPassStatus["missing_accounts"] = coverageStatus["missing_accounts"]
+	}
+	firstPassStatus["negative_lookups_complete"] = secondPassComplete
+	negativeCoverage := "partial"
+	if secondPassComplete {
+		negativeCoverage = "verified_to_coverage_cutoff"
+	}
 	return map[string]any{
 		"count_accuracy": map[string]any{
 			"index_and_queue_totals": "PostgreSQL live-row estimates; refreshed by autovacuum/analyze",
@@ -4039,6 +4230,16 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			},
 		},
 		"coverage": coverageStatus,
+		"passes": map[string]any{
+			"first":  firstPassStatus,
+			"second": secondPassStatus,
+		},
+		"lookup": map[string]any{
+			"usable":                   keys > 0,
+			"positive_matches":         "usable_immediately",
+			"negative_match_coverage":  negativeCoverage,
+			"historical_keys_retained": true,
+		},
 		"progress": progress,
 		"enumeration": map[string]any{
 			"checkpoint_meaning": "furthest parallel shard position; inspect ranges for contiguous coverage",

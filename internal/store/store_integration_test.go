@@ -403,6 +403,51 @@ func TestDueRetryPrecedesPendingWork(t *testing.T) {
 	}
 }
 
+func TestMarkAccountsAttemptedIsDurableAndIdempotent(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	var runID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO crawl_runs (
+		  kind, next_since_id, next_url, enumerated_users
+		) VALUES (
+		  'initial', 42, 'https://api.github.com/users?since=42', 1
+		) RETURNING id
+	`).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO account_queue (
+		  run_id, source, github_id, node_id, login
+		) VALUES ($1, 'global', 42, 'U_42', 'attempted')
+	`, runID); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 1, "global")
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("claim: jobs=%#v err=%v", jobs, err)
+	}
+	if err := database.MarkAccountsAttempted(ctx, jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.MarkAccountsAttempted(ctx, jobs); err != nil {
+		t.Fatalf("repeated first-attempt mark was not idempotent: %v", err)
+	}
+	var attempted int64
+	var firstAttemptedAt *time.Time
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT run.attempted_users, queue.first_attempted_at
+		FROM crawl_runs AS run
+		JOIN account_queue AS queue ON queue.run_id=run.id
+		WHERE run.id=$1
+	`, runID).Scan(&attempted, &firstAttemptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempted != 1 || firstAttemptedAt == nil {
+		t.Fatalf("attempt progress was not persisted exactly once: count=%d at=%v", attempted, firstAttemptedAt)
+	}
+}
+
 func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
@@ -611,10 +656,11 @@ func TestStatusEstimatesCompletionFromLiveShardRanges(t *testing.T) {
 	if err := database.Pool.QueryRow(ctx, `
 		INSERT INTO crawl_runs (
 		  kind, cutoff_user_id, next_since_id, next_url,
-		  enumeration_complete, enumerated_users, processed_users, started_at
+		  enumeration_complete, enumerated_users, attempted_users,
+		  processed_users, started_at
 		) VALUES (
 		  'initial', 2000, 1000, 'https://api.github.com/users?since=1000',
-		  false, 800, 500, now() - interval '1 hour'
+		  false, 800, 500, 500, now() - interval '1 hour'
 		) RETURNING id
 	`).Scan(&runID); err != nil {
 		t.Fatal(err)
@@ -634,11 +680,10 @@ func TestStatusEstimatesCompletionFromLiveShardRanges(t *testing.T) {
 		INSERT INTO crawler_workers (
 		  name, role, state, activity, processed_users,
 		  last_success_at, started_at, heartbeat_at
-		) VALUES
-		  ('graphql-0', 'SSH key batch worker', 'running', 'working', 400,
-		   now(), now() - interval '1 hour', now()),
-		  ('rest-enumerator-0', 'parallel global account enumeration',
-		   'running', 'working', 400, now(), now() - interval '1 hour', now())
+		) VALUES (
+		  'graphql-0', 'SSH key batch worker', 'running', 'working', 400,
+		  now(), now() - interval '1 hour', now()
+		)
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +705,13 @@ func TestStatusEstimatesCompletionFromLiveShardRanges(t *testing.T) {
 	if estimate["estimated_total_low"] != int64(1600) ||
 		estimate["estimated_total_high"] != int64(1800) {
 		t.Fatalf("unexpected estimate bounds: %#v", estimate)
+	}
+	passes := status["passes"].(map[string]any)
+	first := passes["first"].(map[string]any)
+	if first["unattempted_discovered_users"] != int64(300) ||
+		first["estimated_remaining_observations_low"] != int64(1100) ||
+		first["estimated_remaining_observations_high"] != int64(1300) {
+		t.Fatalf("unexpected first-pass progress: %#v", first)
 	}
 }
 

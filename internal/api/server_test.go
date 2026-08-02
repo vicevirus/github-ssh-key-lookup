@@ -17,10 +17,12 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 		"index": map[string]int64{"owners": 12, "keys": 34, "associations": 56},
 		"progress": map[string]any{
 			"phase": "initial_scan", "enumerated_users": int64(1000),
-			"processed_users": int64(700), "processing_backlog": int64(300),
+			"attempted_users": int64(750), "processed_users": int64(700),
+			"processing_backlog":   int64(300),
 			"enumeration_complete": false, "remaining_id_positions": int64(500),
 			"current_enumeration_users_per_hour": 400.0,
 			"estimated_completion": map[string]any{
+				"rate_accounts_per_hour": 390.0,
 				"rate_users_per_hour":    390.0,
 				"estimated_finish_early": finish,
 				"estimated_finish_late":  finish.Add(time.Hour),
@@ -40,9 +42,17 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 			"verification_state":       "initial_crawl_in_progress",
 		},
 		"recovery": map[string]any{"retrying_jobs": int64(0)},
-		"runs":     []store.Run{{ErrorUsers: 2}},
-		"workers":  []store.WorkerStatus{{Name: "internal-worker"}},
-		"pacing":   map[string]any{"graphql": "internal"},
+		"passes": map[string]any{
+			"first":  map[string]any{"status": "running", "complete": false},
+			"second": map[string]any{"status": "waiting_for_first_pass", "complete": false},
+		},
+		"lookup": map[string]any{
+			"usable": true, "positive_matches": "usable_immediately",
+			"negative_match_coverage": "partial",
+		},
+		"runs":    []store.Run{{ErrorUsers: 2}},
+		"workers": []store.WorkerStatus{{Name: "internal-worker"}},
+		"pacing":  map[string]any{"graphql": "internal"},
 	}
 
 	result := compactStatusSnapshot(snapshot)
@@ -58,8 +68,15 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {
 		t.Fatalf("missing compact progress: %#v", progress)
 	}
-	if progress["estimate_scope"] != "current REST ID-range crawl" {
+	if progress["estimate_scope"] != "first pass: REST discovery plus first GraphQL observation" {
 		t.Fatalf("missing honest estimate scope: %#v", progress)
+	}
+	if progress["attempted_users"] != int64(750) || progress["attempt_rate_per_hour"] != 390.0 {
+		t.Fatalf("missing first-attempt progress: %#v", progress)
+	}
+	passes := result["passes"].(map[string]any)
+	if passes["first"] == nil || passes["second"] == nil || result["usable"] != true {
+		t.Fatalf("missing pass or usability status: %#v", result)
 	}
 	coverage := result["coverage"].(map[string]any)
 	if coverage["audit_status"] != "running" || coverage["searchable_users"] != int64(4567) ||

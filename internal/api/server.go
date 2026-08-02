@@ -173,6 +173,8 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	crawler := anyMap(snapshot["crawler"])
 	coverage := anyMap(snapshot["coverage"])
 	recovery := anyMap(snapshot["recovery"])
+	passes := anyMap(snapshot["passes"])
+	lookup := anyMap(snapshot["lookup"])
 	estimate := anyMap(progress["estimated_completion"])
 
 	state := "offline"
@@ -189,6 +191,7 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	}
 	return map[string]any{
 		"status": state,
+		"usable": lookup["usable"],
 		"crawler": map[string]any{
 			"online":            crawler["online"],
 			"phase":             progress["phase"],
@@ -201,17 +204,21 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 		},
 		"progress": map[string]any{
 			"enumerated_users":           progress["enumerated_users"],
+			"attempted_users":            progress["attempted_users"],
 			"processed_users":            progress["processed_users"],
 			"queued_users":               progress["processing_backlog"],
 			"enumeration_complete":       progress["enumeration_complete"],
 			"remaining_id_positions":     progress["remaining_id_positions"],
 			"processing_users_per_hour":  estimate["rate_users_per_hour"],
+			"attempt_rate_per_hour":      estimate["rate_accounts_per_hour"],
 			"enumeration_users_per_hour": progress["current_enumeration_users_per_hour"],
 			"estimated_finish_early":     estimate["estimated_finish_early"],
 			"estimated_finish_late":      estimate["estimated_finish_late"],
 			"estimate_basis":             estimate["basis"],
-			"estimate_scope":             "current REST ID-range crawl",
+			"estimate_scope":             "first pass: REST discovery plus first GraphQL observation",
 		},
+		"passes": passes,
+		"lookup": lookup,
 		"coverage": map[string]any{
 			"initial_complete":         coverage["initial_complete"],
 			"generation_id":            coverage["generation_id"],
