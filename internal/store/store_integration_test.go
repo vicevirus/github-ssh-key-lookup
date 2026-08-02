@@ -355,6 +355,65 @@ func TestStatusIncludesWorkerActivity(t *testing.T) {
 	}
 }
 
+func TestStatusEstimatesCompletionFromLiveShardRanges(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	var runID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO crawl_runs (
+		  kind, cutoff_user_id, next_since_id, next_url,
+		  enumeration_complete, enumerated_users, processed_users, started_at
+		) VALUES (
+		  'initial', 2000, 1000, 'https://api.github.com/users?since=1000',
+		  false, 800, 500, now() - interval '1 hour'
+		) RETURNING id
+	`).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO enumeration_shards (
+		  run_id, lower_id, upper_id, next_since_id, next_url,
+		  status, enumerated_users
+		) VALUES (
+		  $1, 0, 2000, 1000, 'https://api.github.com/users?since=1000',
+		  'running', 800
+		)
+	`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO crawler_workers (
+		  name, role, state, activity, processed_users,
+		  last_success_at, started_at, heartbeat_at
+		) VALUES
+		  ('graphql-0', 'SSH key batch worker', 'running', 'working', 400,
+		   now(), now() - interval '1 hour', now()),
+		  ('rest-enumerator-0', 'parallel global account enumeration',
+		   'running', 'working', 400, now(), now() - interval '1 hour', now())
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := database.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := status["progress"].(map[string]any)
+	estimate := progress["estimated_completion"].(map[string]any)
+	if estimate["basis"] != "active shard ranges and observed user density" {
+		t.Fatalf("status used stale population envelope: %#v", estimate)
+	}
+	if progress["remaining_id_positions"] != int64(1000) ||
+		progress["estimated_future_users"] != int64(800) ||
+		progress["processing_backlog"] != int64(300) {
+		t.Fatalf("unexpected live range estimate: %#v", progress)
+	}
+	if estimate["estimated_total_low"] != int64(1600) ||
+		estimate["estimated_total_high"] != int64(1800) {
+		t.Fatalf("unexpected estimate bounds: %#v", estimate)
+	}
+}
+
 func TestCompletedInitialRunStartsGlobalReconciliationAtZero(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
