@@ -39,6 +39,32 @@ func TestListUsersAndRateHeaders(t *testing.T) {
 	}
 }
 
+func TestSearchUserCountPreservesIncompleteFlagAndQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search/users" ||
+			request.URL.Query().Get("q") != "type:user created:2026-08-01" ||
+			request.URL.Query().Get("per_page") != "1" {
+			t.Fatalf("unexpected search request: %s", request.URL.String())
+		}
+		response.Header().Set("X-RateLimit-Limit", "30")
+		response.Header().Set("X-RateLimit-Remaining", "29")
+		response.Header().Set("X-RateLimit-Resource", "search")
+		_, _ = response.Write([]byte(`{"total_count":12345,"incomplete_results":true,"items":[]}`))
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.RESTBase = server.URL
+	client.HTTP = server.Client()
+	result, err := client.SearchUserCount(context.Background(), "type:user created:2026-08-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalCount != 12345 || !result.IncompleteResults ||
+		result.Rate.Resource != "search" || result.Rate.Remaining != 29 {
+		t.Fatalf("unexpected search count: %#v", result)
+	}
+}
+
 func TestFetchUsersEnforcesVerifiedHundredIDLimitAndCost(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {

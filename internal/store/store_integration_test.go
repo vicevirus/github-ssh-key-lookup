@@ -414,6 +414,42 @@ func TestStatusEstimatesCompletionFromLiveShardRanges(t *testing.T) {
 	}
 }
 
+func TestCoverageAuditDateCheckpointsAreRestartSafe(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	if err := database.SaveCoverageAuditDay(ctx, CoverageAuditEpoch, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SaveCoverageAuditDay(ctx, CoverageAuditEpoch.Add(24*time.Hour), 20); err != nil {
+		t.Fatal(err)
+	}
+	// Re-saving the last durable day simulates a retry after an uncertain
+	// process exit. It replaces the partition count instead of double-counting.
+	if err := database.SaveCoverageAuditDay(ctx, CoverageAuditEpoch.Add(24*time.Hour), 21); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := CoverageAuditEpoch.Add(3 * 24 * time.Hour)
+	progress, err := database.CoverageAuditProgress(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Complete || progress.DaysComplete != 2 || progress.DaysTotal != 3 ||
+		progress.SearchableUsers != 31 ||
+		!progress.NextDay.Equal(CoverageAuditEpoch.Add(2*24*time.Hour)) {
+		t.Fatalf("unexpected durable audit progress: %#v", progress)
+	}
+	if err := database.SaveCoverageAuditDay(ctx, progress.NextDay, 30); err != nil {
+		t.Fatal(err)
+	}
+	progress, err = database.CoverageAuditProgress(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !progress.Complete || progress.SearchableUsers != 61 || !progress.NextDay.Equal(cutoff) {
+		t.Fatalf("audit did not complete exactly once: %#v", progress)
+	}
+}
+
 func TestCompletedInitialRunStartsGlobalReconciliationAtZero(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()

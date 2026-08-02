@@ -25,8 +25,10 @@ type Config struct {
 	QueueMax              int
 	RESTPerHour           int
 	GraphQLPerHour        int
+	SearchPerHour         int
 	RESTReserve           int
 	GraphQLReserve        int
+	SearchReserve         int
 	TailPollInterval      time.Duration
 	OwnerRefresh          time.Duration
 	OwnerSchedule         []time.Duration
@@ -42,8 +44,10 @@ func DefaultConfig() Config {
 		QueueMax:         10_000,
 		RESTPerHour:      4_700,
 		GraphQLPerHour:   3_600,
+		SearchPerHour:    600,
 		RESTReserve:      150,
 		GraphQLReserve:   200,
+		SearchReserve:    2,
 		TailPollInterval: time.Minute,
 		OwnerRefresh:     7 * 24 * time.Hour,
 		OwnerSchedule: []time.Duration{
@@ -74,6 +78,7 @@ type Service struct {
 	Logger  *slog.Logger
 	rest    *ratelimit.Pacer
 	graphql *ratelimit.Pacer
+	search  *ratelimit.Pacer
 
 	scheduleMu     sync.Mutex
 	scheduleCursor int
@@ -91,6 +96,9 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	}
 	if config.QueueMax < 100 {
 		config.QueueMax = 100
+	}
+	if config.SearchPerHour < 1 {
+		config.SearchPerHour = 600
 	}
 	if config.EstimatedAccountsLow <= 0 {
 		config.EstimatedAccountsLow = 190_000_000
@@ -110,6 +118,7 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 		Store: database, GitHub: github, Config: config, Logger: logger,
 		rest:    ratelimit.New(config.RESTPerHour, config.RESTReserve),
 		graphql: ratelimit.New(config.GraphQLPerHour, config.GraphQLReserve),
+		search:  ratelimit.New(config.SearchPerHour, config.SearchReserve),
 	}
 }
 
@@ -135,6 +144,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	s.recordPacer(ctx, "rest", s.rest)
 	s.recordPacer(ctx, "graphql", s.graphql)
+	s.recordPacer(ctx, "search", s.search)
 	if _, err := s.Store.EnsureMainRun(ctx, s.GitHub.UsersURL(0)); err != nil {
 		return err
 	}
@@ -162,6 +172,7 @@ func (s *Service) Run(ctx context.Context) error {
 	group.Go(func() error { return s.tail(groupCtx) })
 	group.Go(func() error { return s.priorityOwners(groupCtx) })
 	group.Go(func() error { return s.zeroKeyRechecks(groupCtx) })
+	group.Go(func() error { return s.coverageAudit(groupCtx) })
 	group.Go(func() error { return s.monitorRuns(groupCtx) })
 	return group.Wait()
 }
@@ -678,6 +689,128 @@ func (s *Service) tail(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) coverageAudit(ctx context.Context) error {
+	const worker = "coverage-auditor"
+	const role = "searchable account coverage audit"
+	s.workerActivity(ctx, worker, role, "running", "checking durable date partitions")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	failures := 0
+	for ctx.Err() == nil {
+		cutoff := time.Now().UTC().Truncate(24 * time.Hour)
+		progress, err := s.Store.CoverageAuditProgress(ctx, cutoff)
+		if err != nil {
+			failures++
+			s.coverageAuditError(ctx, worker, role, err)
+			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
+				return nil
+			}
+			continue
+		}
+		if progress.Complete {
+			_ = s.Store.SetState(ctx, "coverage_audit_status", "complete")
+			_ = s.Store.SetState(ctx, "coverage_audit_last_error", "")
+			s.workerActivity(ctx, worker, role, "waiting",
+				fmt.Sprintf("audited searchable accounts through %s",
+					cutoff.Add(-24*time.Hour).Format(time.DateOnly)))
+			next := cutoff.Add(24*time.Hour + 15*time.Minute)
+			if err := sleep(ctx, time.Until(next)); err != nil {
+				return nil
+			}
+			continue
+		}
+
+		day := progress.NextDay
+		_ = s.Store.SetState(ctx, "coverage_audit_status", "running")
+		s.workerActivity(ctx, worker, role, "running",
+			fmt.Sprintf("counting searchable users created %s", day.Format(time.DateOnly)))
+		count, err := s.searchUserCountRange(
+			ctx, worker, role, day, day.Add(24*time.Hour-time.Second),
+		)
+		if err == nil {
+			err = s.Store.SaveCoverageAuditDay(ctx, day, count)
+		}
+		if err != nil {
+			failures++
+			s.coverageAuditError(ctx, worker, role, err)
+			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
+				return nil
+			}
+			continue
+		}
+		failures = 0
+		_ = s.Store.SetState(ctx, "coverage_audit_last_error", "")
+		_ = s.Store.SetState(ctx, "coverage_audit_last_success_at",
+			time.Now().UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+func (s *Service) coverageAuditError(
+	ctx context.Context, worker, role string, err error,
+) {
+	message := err.Error()
+	if len(message) > 2_000 {
+		message = message[:2_000]
+	}
+	_ = s.Store.SetState(ctx, "coverage_audit_status", "retrying")
+	_ = s.Store.SetState(ctx, "coverage_audit_last_error", message)
+	s.workerError(ctx, worker, role, "coverage partition failed; retrying", err)
+}
+
+func (s *Service) searchUserCountRange(
+	ctx context.Context,
+	worker string,
+	role string,
+	start time.Time,
+	end time.Time,
+) (int64, error) {
+	const timestamp = "2006-01-02T15:04:05Z"
+	query := fmt.Sprintf(
+		"type:user created:%s..%s",
+		start.UTC().Format(timestamp), end.UTC().Format(timestamp),
+	)
+	if err := s.search.Wait(ctx); err != nil {
+		return 0, err
+	}
+	result, err := s.GitHub.SearchUserCount(ctx, query)
+	if err != nil {
+		s.handleRateError(ctx, err, s.search, "search")
+		return 0, err
+	}
+	s.search.Observe(result.Rate)
+	s.recordPacer(ctx, "search", s.search)
+	s.workerRequest(ctx, worker, role,
+		fmt.Sprintf("counted created range %s to %s", start.Format(timestamp), end.Format(timestamp)),
+		result.Rate, 0, 0)
+	if !result.IncompleteResults {
+		return result.TotalCount, nil
+	}
+	leftStart, leftEnd, rightStart, rightEnd, splittable := splitSearchTimeRange(start, end)
+	if !splittable {
+		return 0, fmt.Errorf("GitHub search remained incomplete for creation second %s", start.Format(timestamp))
+	}
+	left, err := s.searchUserCountRange(ctx, worker, role, leftStart, leftEnd)
+	if err != nil {
+		return 0, err
+	}
+	right, err := s.searchUserCountRange(ctx, worker, role, rightStart, rightEnd)
+	if err != nil {
+		return 0, err
+	}
+	return left + right, nil
+}
+
+func splitSearchTimeRange(start, end time.Time) (
+	leftStart, leftEnd, rightStart, rightEnd time.Time, ok bool,
+) {
+	seconds := int64(end.Sub(start) / time.Second)
+	if seconds < 1 {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, false
+	}
+	midpoint := start.Add(time.Duration(seconds/2) * time.Second)
+	return start, midpoint, midpoint.Add(time.Second), end, true
 }
 
 func (s *Service) ensureLiveTail(ctx context.Context, worker, role string) error {
