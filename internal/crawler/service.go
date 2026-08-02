@@ -24,6 +24,7 @@ import (
 
 type Config struct {
 	Workers               int
+	RESTFallbackWorkers   int
 	QueueMax              int
 	RESTPerHour           int
 	GraphQLPerHour        int
@@ -42,16 +43,17 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Workers:          4,
-		QueueMax:         10_000,
-		RESTPerHour:      4_700,
-		GraphQLPerHour:   3_600,
-		SearchPerHour:    1_500,
-		RESTReserve:      150,
-		GraphQLReserve:   200,
-		SearchReserve:    2,
-		TailPollInterval: time.Minute,
-		OwnerRefresh:     7 * 24 * time.Hour,
+		Workers:             4,
+		RESTFallbackWorkers: 1,
+		QueueMax:            10_000,
+		RESTPerHour:         4_700,
+		GraphQLPerHour:      3_600,
+		SearchPerHour:       1_500,
+		RESTReserve:         150,
+		GraphQLReserve:      200,
+		SearchReserve:       2,
+		TailPollInterval:    time.Minute,
+		OwnerRefresh:        7 * 24 * time.Hour,
 		OwnerSchedule: []time.Duration{
 			6 * time.Hour,
 			18 * time.Hour,
@@ -96,6 +98,12 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	}
 	if config.Workers > 10 {
 		config.Workers = 10
+	}
+	if config.RESTFallbackWorkers < 1 {
+		config.RESTFallbackWorkers = 1
+	}
+	if config.RESTFallbackWorkers > 10 {
+		config.RESTFallbackWorkers = 10
 	}
 	if config.QueueMax < 100 {
 		config.QueueMax = 100
@@ -160,6 +168,10 @@ func (s *Service) Run(ctx context.Context) error {
 	for worker := 0; worker < s.Config.Workers; worker++ {
 		workerID := worker
 		group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
+	}
+	for worker := 0; worker < s.Config.RESTFallbackWorkers; worker++ {
+		workerID := worker
+		group.Go(func() error { return s.restFallbackWorker(groupCtx, workerID) })
 	}
 
 	// Let REST build several full batches so the first GraphQL requests do not
@@ -459,16 +471,6 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			}
 			continue
 		}
-		// Repeated batch failures are isolated so one unusual account cannot
-		// poison 99 healthy neighbors forever.
-		if len(jobs) > 1 && maxJobAttempts(jobs) >= 3 {
-			rest := append([]model.Candidate(nil), jobs[1:]...)
-			_ = s.Store.RequeueAccountsAfter(
-				context.Background(), rest,
-				errors.New("isolating repeatedly failing GraphQL account"), time.Second,
-			)
-			jobs = jobs[:1]
-		}
 		ids := make([]string, len(jobs))
 		for index := range jobs {
 			ids[index] = jobs[index].NodeID
@@ -483,9 +485,22 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		if err != nil {
 			s.workerError(ctx, worker, role, "GraphQL account batch failed", err)
 			s.handleRateError(ctx, err, s.graphql, "graphql")
-			_ = s.Store.RequeueAccountsAfter(
-				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
-			)
+			fallback, retry := splitFailedGraphQLBatch(jobs, err)
+			if len(fallback) > 0 {
+				if moveErr := s.Store.MoveAccountsToRESTFallback(
+					context.Background(), fallback, err,
+				); moveErr != nil {
+					return fmt.Errorf("persist GraphQL fallback: %w", moveErr)
+				}
+			}
+			if len(retry) > 0 {
+				if retryErr := s.Store.RequeueAccountsAfter(
+					context.Background(), retry, err,
+					retryDelay(err, maxJobAttempts(retry)),
+				); retryErr != nil {
+					return fmt.Errorf("persist GraphQL retry: %w", retryErr)
+				}
+			}
 			if isAuthenticationError(err) {
 				return err
 			}
@@ -494,11 +509,13 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		}
 		s.graphql.Observe(response.Rate)
 		s.graphql.ExtraCost(response.Rate.Cost)
-		results, err := normalizeUsers(jobs, response.Nodes)
+		results, resultErrors, err := normalizeUsers(jobs, response.Nodes)
 		if err != nil {
-			_ = s.Store.RequeueAccountsAfter(
-				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
-			)
+			if moveErr := s.Store.MoveAccountsToRESTFallback(
+				context.Background(), jobs, err,
+			); moveErr != nil {
+				return fmt.Errorf("persist invalid GraphQL response fallback: %w", moveErr)
+			}
 			s.Logger.Error("invalid GitHub key response", "error", err)
 			continue
 		}
@@ -512,7 +529,15 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		validJobs := make([]model.Candidate, 0, len(jobs))
 		validResults := make([]*model.UserResult, 0, len(jobs))
 		missingJobs := make([]model.Candidate, 0)
+		invalidJobs := make([]model.Candidate, 0)
 		for index, result := range results {
+			if resultErrors[index] != nil {
+				invalidJobs = append(invalidJobs, jobs[index])
+				s.Logger.Warn("invalid per-account GraphQL key response",
+					"github_id", jobs[index].GitHubID,
+					"error", resultErrors[index])
+				continue
+			}
 			if result == nil {
 				missingJobs = append(missingJobs, jobs[index])
 				continue
@@ -530,8 +555,21 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			)
 			return fmt.Errorf("commit GraphQL account results: %w", err)
 		}
-		if err := s.handleMissingAccounts(ctx, missingJobs); err != nil {
-			return err
+		if len(missingJobs) > 0 {
+			notFound := errors.New("GitHub GraphQL returned a null account node")
+			if err := s.Store.MoveAccountsToRESTFallback(
+				context.Background(), missingJobs, notFound,
+			); err != nil {
+				return fmt.Errorf("persist null-node REST fallback: %w", err)
+			}
+		}
+		if len(invalidJobs) > 0 {
+			invalid := errors.New("GitHub GraphQL returned an invalid per-account key snapshot")
+			if err := s.Store.MoveAccountsToRESTFallback(
+				context.Background(), invalidJobs, invalid,
+			); err != nil {
+				return fmt.Errorf("persist invalid-account REST fallback: %w", err)
+			}
 		}
 		keyCount := 0
 		for _, result := range results {
@@ -552,60 +590,184 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 	return nil
 }
 
-func (s *Service) handleMissingAccounts(
-	ctx context.Context, jobs []model.Candidate,
-) error {
+func splitFailedGraphQLBatch(
+	jobs []model.Candidate, err error,
+) (fallback, retry []model.Candidate) {
+	var limited *githubapi.RateLimitError
+	if errors.As(err, &limited) || isAuthenticationError(err) {
+		return nil, jobs
+	}
 	for _, job := range jobs {
-		notFound := fmt.Errorf("GitHub GraphQL returned null for account %d", job.GitHubID)
-		if job.Attempts < 3 && job.Source != "anomaly" {
-			delay := time.Hour
-			if job.Attempts >= 2 {
-				delay = 24 * time.Hour
-			}
-			if err := s.Store.RequeueAccountsAfter(
-				context.Background(), []model.Candidate{job}, notFound, delay,
-			); err != nil {
-				return err
+		if job.Attempts >= 3 {
+			fallback = append(fallback, job)
+		} else {
+			retry = append(retry, job)
+		}
+	}
+	return fallback, retry
+}
+
+func (s *Service) restFallbackWorker(ctx context.Context, workerID int) error {
+	worker := fmt.Sprintf("rest-fallback-%d", workerID)
+	role := "identity-safe REST key fallback"
+	s.workerActivity(ctx, worker, role, "starting", "waiting for GraphQL-null accounts")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	for ctx.Err() == nil {
+		job, err := s.Store.ClaimRESTFallback(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.workerActivity(ctx, worker, role, "waiting", "REST fallback queue is current")
+			if err := sleep(ctx, 500*time.Millisecond); err != nil {
+				return nil
 			}
 			continue
 		}
-		if err := s.rest.Wait(ctx); err != nil {
-			return err
-		}
-		user, rate, err := s.GitHub.GetUserByID(ctx, job.GitHubID)
 		if err != nil {
-			s.handleRateError(ctx, err, s.rest, "rest")
-			if requeueErr := s.Store.RequeueAccountsAfter(
-				context.Background(), []model.Candidate{job}, err,
-				retryDelay(err, job.Attempts),
-			); requeueErr != nil {
-				return requeueErr
-			}
-			if isAuthenticationError(err) {
-				return err
-			}
-			continue
-		}
-		s.rest.Observe(rate)
-		if user == nil {
-			if err := s.Store.CompleteInaccessible(ctx, job); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := s.Store.RefreshClaimIdentity(
-			ctx, job, user.NodeID, user.Login,
-		); err != nil {
 			return err
 		}
-		job.NodeID, job.Login = user.NodeID, user.Login
-		if err := s.Store.RequeueAccountsAfter(
-			context.Background(), []model.Candidate{job}, notFound, 6*time.Hour,
-		); err != nil {
+		if err := s.processRESTFallback(ctx, worker, role, *job); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Service) processRESTFallback(
+	ctx context.Context, worker, role string, job model.Candidate,
+) error {
+	user, keys, err := s.fetchRESTSnapshot(ctx, worker, role, job.GitHubID)
+	if err != nil {
+		if retryErr := s.Store.RequeueRESTFallbackAfter(
+			context.Background(), job, err, retryDelay(err, job.FallbackAttempts),
+		); retryErr != nil {
+			return retryErr
+		}
+		if isAuthenticationError(err) {
+			return err
+		}
+		return nil
+	}
+	if user == nil {
+		if err := s.Store.CompleteInaccessible(ctx, job); err != nil {
+			return err
+		}
+		s.workerCompleted(ctx, worker, role, "classified inaccessible account", 1, 0)
+		return nil
+	}
+	if err := s.Store.RefreshClaimIdentity(ctx, job, user.NodeID, user.Login); err != nil {
+		return err
+	}
+	job.NodeID, job.Login = user.NodeID, user.Login
+	result := &model.UserResult{
+		NodeID: user.NodeID, GitHubID: user.ID, Login: user.Login,
+		CreatedAt: user.CreatedAt, Keys: keys, TotalKeyCount: len(keys),
+	}
+	if err := s.Store.CompleteAccountsScheduled(
+		ctx, []model.Candidate{job}, []*model.UserResult{result},
+		s.Config.OwnerSchedule, s.Config.ZeroKeyRecheckAges,
+	); err != nil {
+		if retryErr := s.Store.RequeueRESTFallbackAfter(
+			context.Background(), job, err, retryDelay(err, job.FallbackAttempts),
+		); retryErr != nil {
+			return fmt.Errorf("commit REST fallback result: %w (retry: %v)", err, retryErr)
+		}
+		return nil
+	}
+	s.workerCompleted(ctx, worker, role, "indexed identity-safe REST key snapshot", 1, len(keys))
+	return nil
+}
+
+func (s *Service) fetchRESTSnapshot(
+	ctx context.Context, worker, role string, githubID int64,
+) (*githubapi.RESTUser, []model.PublicKey, error) {
+	if err := s.rest.Wait(ctx); err != nil {
+		return nil, nil, err
+	}
+	user, rate, err := s.GitHub.GetUserByID(ctx, githubID)
+	if err != nil {
+		s.workerError(ctx, worker, role, "REST identity resolution failed", err)
+		s.handleRateError(ctx, err, s.rest, "rest")
+		return nil, nil, err
+	}
+	s.rest.Observe(rate)
+	s.workerRequest(ctx, worker, role, "resolved durable GitHub account ID", rate, 0, 0)
+	if user == nil || user.Type != "User" {
+		return nil, nil, nil
+	}
+	if user.NodeID == "" || user.Login == "" || user.CreatedAt.IsZero() {
+		return nil, nil, fmt.Errorf("GitHub REST returned incomplete identity for account %d", githubID)
+	}
+	first, pages, err := s.fetchRESTKeyPass(ctx, worker, role, user.Login)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := normalizeRESTKeys(first)
+	if err != nil {
+		return nil, nil, fmt.Errorf("REST key snapshot: %w", err)
+	}
+	if pages > 1 {
+		second, _, err := s.fetchRESTKeyPass(ctx, worker, role, user.Login)
+		if err != nil {
+			return nil, nil, err
+		}
+		verified, err := normalizeRESTKeys(second)
+		if err != nil {
+			return nil, nil, fmt.Errorf("REST verification snapshot: %w", err)
+		}
+		if !sameKeySet(keys, verified) {
+			return nil, nil, errors.New("REST key set changed between pagination passes")
+		}
+		keys = verified
+	}
+	return user, keys, nil
+}
+
+func (s *Service) fetchRESTKeyPass(
+	ctx context.Context, worker, role, login string,
+) ([]string, int, error) {
+	requestURL := s.GitHub.PublicKeysURL(login)
+	seenURLs := make(map[string]bool)
+	rawKeys := make([]string, 0)
+	pages := 0
+	for requestURL != "" {
+		if seenURLs[requestURL] {
+			return nil, pages, errors.New("REST public-key pagination repeated a URL")
+		}
+		seenURLs[requestURL] = true
+		if err := s.rest.Wait(ctx); err != nil {
+			return nil, pages, err
+		}
+		page, err := s.GitHub.ListPublicKeys(ctx, requestURL)
+		if err != nil {
+			s.workerError(ctx, worker, role, "REST public-key page failed", err)
+			s.handleRateError(ctx, err, s.rest, "rest")
+			return nil, pages, err
+		}
+		s.rest.Observe(page.Rate)
+		s.workerRequest(ctx, worker, role, "fetched REST public-key page", page.Rate, 0, len(page.Keys))
+		if page.NotFound {
+			return nil, pages, fmt.Errorf("public-key endpoint changed during identity resolution for %s", login)
+		}
+		rawKeys = append(rawKeys, page.Keys...)
+		pages++
+		requestURL = page.NextURL
+	}
+	return rawKeys, pages, nil
+}
+
+func sameKeySet(left, right []model.PublicKey) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]bool, len(left))
+	for _, key := range left {
+		seen[key.Text] = true
+	}
+	for _, key := range right {
+		if !seen[key.Text] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) nextQueueClass() string {
@@ -648,6 +810,10 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 	if err != nil {
 		s.workerError(ctx, worker, role, "GraphQL overflow page failed", err)
 		s.handleRateError(ctx, err, s.graphql, "graphql")
+		var limited *githubapi.RateLimitError
+		if job.Attempts >= 3 && !errors.As(err, &limited) && !isAuthenticationError(err) {
+			return s.processOverflowREST(ctx, worker, role, job)
+		}
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		if isAuthenticationError(err) {
 			return err
@@ -658,9 +824,7 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 	s.graphql.Observe(rate)
 	s.graphql.ExtraCost(rate.Cost)
 	if user == nil {
-		err = fmt.Errorf("overflow user %d became inaccessible", job.GitHubID)
-		_ = s.Store.RequeueOverflow(context.Background(), job, err)
-		return nil
+		return s.processOverflowREST(ctx, worker, role, job)
 	}
 	if user.ID != job.NodeID || user.DatabaseID != job.GitHubID {
 		err = fmt.Errorf(
@@ -719,37 +883,83 @@ func (s *Service) processOverflow(ctx context.Context, workerID int, job model.O
 	return nil
 }
 
-func normalizeUsers(jobs []model.Candidate, nodes []*githubapi.GraphQLUser) ([]*model.UserResult, error) {
+func (s *Service) processOverflowREST(
+	ctx context.Context, worker, role string, job model.OverflowJob,
+) error {
+	user, keys, err := s.fetchRESTSnapshot(ctx, worker, role, job.GitHubID)
+	if err != nil {
+		if retryErr := s.Store.RequeueOverflowAfter(
+			context.Background(), job, err, retryDelay(err, job.Attempts),
+		); retryErr != nil {
+			return retryErr
+		}
+		if isAuthenticationError(err) {
+			return err
+		}
+		return nil
+	}
+	if user == nil {
+		err := fmt.Errorf("overflow account %d is currently inaccessible", job.GitHubID)
+		return s.Store.RequeueOverflowAfter(
+			context.Background(), job, err, 6*time.Hour,
+		)
+	}
+	result := &model.UserResult{
+		NodeID: user.NodeID, GitHubID: user.ID, Login: user.Login,
+		CreatedAt: user.CreatedAt, Keys: keys, TotalKeyCount: len(keys),
+	}
+	if err := s.Store.CompleteOverflowFromREST(
+		ctx, job, result, s.Config.OwnerSchedule,
+	); err != nil {
+		if retryErr := s.Store.RequeueOverflowAfter(
+			context.Background(), job, err, retryDelay(err, job.Attempts),
+		); retryErr != nil {
+			return fmt.Errorf("commit REST overflow result: %w (retry: %v)", err, retryErr)
+		}
+		return nil
+	}
+	s.workerCompleted(ctx, worker, role, "indexed REST overflow key snapshot", 0, len(keys))
+	return nil
+}
+
+func normalizeUsers(
+	jobs []model.Candidate, nodes []*githubapi.GraphQLUser,
+) ([]*model.UserResult, []error, error) {
 	if len(jobs) != len(nodes) {
-		return nil, errors.New("GraphQL response cardinality mismatch")
+		return nil, nil, errors.New("GraphQL response cardinality mismatch")
 	}
 	results := make([]*model.UserResult, len(nodes))
+	resultErrors := make([]error, len(nodes))
 	for index, user := range nodes {
 		if user == nil || user.TypeName != "User" {
 			continue
 		}
 		if user.ID != jobs[index].NodeID || user.DatabaseID != jobs[index].GitHubID {
-			return nil, fmt.Errorf(
+			resultErrors[index] = fmt.Errorf(
 				"GraphQL identity mismatch: expected %s/%d, received %s/%d",
 				jobs[index].NodeID, jobs[index].GitHubID, user.ID, user.DatabaseID,
 			)
+			continue
 		}
 		if user.CreatedAt.IsZero() {
-			return nil, fmt.Errorf("GraphQL account %d has no createdAt", user.DatabaseID)
+			resultErrors[index] = fmt.Errorf("GraphQL account %d has no createdAt", user.DatabaseID)
+			continue
 		}
 		keys, err := normalizeKeys(user.PublicKeys.Nodes)
 		if err != nil {
-			return nil, fmt.Errorf("GraphQL account %d key snapshot: %w", user.DatabaseID, err)
+			resultErrors[index] = fmt.Errorf("GraphQL account %d key snapshot: %w", user.DatabaseID, err)
+			continue
 		}
 		if user.PublicKeys.TotalCount < len(keys) ||
 			(!user.PublicKeys.PageInfo.HasNextPage && user.PublicKeys.TotalCount != len(keys)) ||
 			(user.PublicKeys.PageInfo.HasNextPage &&
 				(user.PublicKeys.TotalCount <= len(keys) || user.PublicKeys.PageInfo.EndCursor == "")) {
-			return nil, fmt.Errorf(
+			resultErrors[index] = fmt.Errorf(
 				"GraphQL account %d inconsistent key connection: total=%d nodes=%d has_more=%t",
 				user.DatabaseID, user.PublicKeys.TotalCount, len(keys),
 				user.PublicKeys.PageInfo.HasNextPage,
 			)
+			continue
 		}
 		results[index] = &model.UserResult{
 			NodeID: user.ID, GitHubID: jobs[index].GitHubID, Login: user.Login,
@@ -759,7 +969,7 @@ func normalizeUsers(jobs []model.Candidate, nodes []*githubapi.GraphQLUser) ([]*
 			TotalKeyCount: user.PublicKeys.TotalCount,
 		}
 	}
-	return results, nil
+	return results, resultErrors, nil
 }
 
 func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {
@@ -772,6 +982,23 @@ func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {
 		}
 		if raw.Fingerprint == "" || raw.Fingerprint != key.Text {
 			return nil, fmt.Errorf("fingerprint mismatch: GitHub=%q calculated=%q", raw.Fingerprint, key.Text)
+		}
+		if seen[key.Text] {
+			return nil, fmt.Errorf("duplicate key fingerprint %s", key.Text)
+		}
+		seen[key.Text] = true
+		result = append(result, key)
+	}
+	return result, nil
+}
+
+func normalizeRESTKeys(rawKeys []string) ([]model.PublicKey, error) {
+	result := make([]model.PublicKey, 0, len(rawKeys))
+	seen := make(map[string]bool, len(rawKeys))
+	for _, raw := range rawKeys {
+		key, err := sshkey.Parse(raw)
+		if err != nil {
+			return nil, err
 		}
 		if seen[key.Text] {
 			return nil, fmt.Errorf("duplicate key fingerprint %s", key.Text)
@@ -1457,6 +1684,15 @@ func (s *Service) workerRequest(
 		ProcessedUsers: users, ProcessedKeys: keys, Request: true,
 		RateRemaining: &remaining, RateLimit: &limit, RateResetAt: &resetAt,
 		Success: true,
+	})
+}
+
+func (s *Service) workerCompleted(
+	ctx context.Context, name, role, activity string, users, keys int,
+) {
+	_ = s.Store.UpdateWorker(ctx, store.WorkerUpdate{
+		Name: name, Role: role, State: "running", Activity: activity,
+		ProcessedUsers: users, ProcessedKeys: keys, Success: true,
 	})
 }
 

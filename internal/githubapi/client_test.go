@@ -268,3 +268,52 @@ func TestFetchUsersClassifiesSecondaryRateLimit(t *testing.T) {
 		t.Fatalf("secondary limit was not classified: %v", err)
 	}
 }
+
+func TestListPublicKeysPaginatesAndPreservesRawKeys(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("per_page") != "100" {
+			t.Fatalf("missing maximum page size: %s", request.URL.String())
+		}
+		response.Header().Set("X-RateLimit-Resource", "core")
+		response.Header().Set("X-RateLimit-Remaining", "4999")
+		if request.URL.Query().Get("page") == "2" {
+			_, _ = response.Write([]byte(`[{"key":"ssh-ed25519 SECOND"}]`))
+			return
+		}
+		response.Header().Set("Link", fmt.Sprintf(`<%s/users/alice/keys?per_page=100&page=2>; rel="next"`, server.URL))
+		_, _ = response.Write([]byte(`[{"key":"ssh-ed25519 FIRST"}]`))
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.RESTBase = server.URL
+	client.HTTP = server.Client()
+	page, err := client.ListPublicKeys(context.Background(), client.PublicKeysURL("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Keys) != 1 || page.Keys[0] != "ssh-ed25519 FIRST" || page.NextURL == "" {
+		t.Fatalf("unexpected first page: %#v", page)
+	}
+	page, err = client.ListPublicKeys(context.Background(), page.NextURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Keys) != 1 || page.Keys[0] != "ssh-ed25519 SECOND" || page.NextURL != "" {
+		t.Fatalf("unexpected second page: %#v", page)
+	}
+}
+
+func TestListPublicKeysReturnsExplicitNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.RESTBase = server.URL
+	client.HTTP = server.Client()
+	page, err := client.ListPublicKeys(context.Background(), client.PublicKeysURL("gone"))
+	if err != nil || !page.NotFound {
+		t.Fatalf("404 was not preserved: page=%#v err=%v", page, err)
+	}
+}

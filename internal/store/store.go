@@ -817,6 +817,7 @@ func currentSchemaReady(ctx context.Context, database migrationQuerier) (bool, e
 		  to_regclass('public.zero_key_rechecks') IS NOT NULL AND
 		  to_regclass('public.overflow_queue') IS NOT NULL AND
 		  to_regclass('public.account_queue_ready_source_idx') IS NOT NULL AND
+		  to_regclass('public.account_queue_rest_fallback_due_idx') IS NOT NULL AND
 		  EXISTS (
 		    SELECT 1 FROM information_schema.columns
 		    WHERE table_schema = 'public' AND table_name = 'github_owner_keys'
@@ -826,6 +827,11 @@ func currentSchemaReady(ctx context.Context, database migrationQuerier) (bool, e
 		    SELECT 1 FROM information_schema.columns
 		    WHERE table_schema = 'public' AND table_name = 'account_queue'
 		      AND column_name = 'last_error_at'
+		  ) AND
+		  EXISTS (
+		    SELECT 1 FROM information_schema.columns
+		    WHERE table_schema = 'public' AND table_name = 'account_queue'
+		      AND column_name = 'fallback_attempts'
 		  ) AND
 		  EXISTS (
 		    SELECT 1 FROM information_schema.columns
@@ -839,11 +845,15 @@ func currentSchemaReady(ctx context.Context, database migrationQuerier) (bool, e
 func (s *Store) Recover(ctx context.Context) error {
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE account_queue
-		SET status = 'retry', claimed_at = NULL, claim_token = NULL,
+		SET status = CASE
+		      WHEN status = 'rest_fallback_running' THEN 'rest_fallback'
+		      ELSE 'retry'
+		    END,
+		    claimed_at = NULL, claim_token = NULL,
 		    lease_expires_at = NULL, next_attempt_at = now(),
 		    last_error = COALESCE(last_error, 'recovered after restart'),
 		    last_error_at = now()
-		WHERE status = 'running';
+		WHERE status IN ('running', 'rest_fallback_running');
 		UPDATE overflow_queue
 		SET status = 'retry', claimed_at = NULL, claim_token = NULL,
 		    lease_expires_at = NULL, next_attempt_at = now(),
@@ -1690,7 +1700,7 @@ func claimAccountSourceStatus(
 		)
 		UPDATE account_queue AS q
 		SET status = 'running', attempts = attempts + 1,
-		    claimed_at = now(), lease_expires_at = now() + interval '5 minutes',
+		    claimed_at = now(), lease_expires_at = now() + interval '2 hours',
 		    claim_token = gen_random_uuid(),
 		    last_error = NULL, last_error_at = NULL
 		FROM picked
@@ -2352,32 +2362,15 @@ func (s *Store) RequeueAccountsAfter(
 	if len(jobs) == 0 {
 		return nil
 	}
-	retryJobs := make([]model.Candidate, 0, len(jobs))
-	quarantine := make([]model.Candidate, 0)
+	ids := make([]int64, 0, len(jobs))
+	tokens := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		if job.Attempts >= 8 || job.Source == "anomaly" {
-			quarantine = append(quarantine, job)
-		} else {
-			retryJobs = append(retryJobs, job)
-		}
-	}
-	if len(quarantine) > 0 {
-		if err := s.quarantineAccounts(ctx, quarantine, cause); err != nil {
-			return err
-		}
-	}
-	if len(retryJobs) == 0 {
-		return nil
-	}
-	ids := make([]int64, 0, len(retryJobs))
-	tokens := make([]string, 0, len(retryJobs))
-	for _, job := range retryJobs {
 		ids = append(ids, job.QueueID)
 		tokens = append(tokens, job.ClaimToken)
 	}
 	if delay <= 0 {
 		attempt := 1
-		for _, job := range retryJobs {
+		for _, job := range jobs {
 			attempt = max(attempt, job.Attempts)
 		}
 		exponent := min(attempt-1, 12)
@@ -2394,11 +2387,101 @@ func (s *Store) RequeueAccountsAfter(
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != int64(len(retryJobs)) {
+	if tag.RowsAffected() != int64(len(jobs)) {
 		return fmt.Errorf(
 			"stale account retry claims: updated %d of %d",
-			tag.RowsAffected(), len(retryJobs),
+			tag.RowsAffected(), len(jobs),
 		)
+	}
+	return nil
+}
+
+// MoveAccountsToRESTFallback removes accounts from the GraphQL lane without
+// settling them. The REST lane resolves the immutable numeric ID, follows the
+// complete public-key pagination chain, and only then commits coverage.
+func (s *Store) MoveAccountsToRESTFallback(
+	ctx context.Context, jobs []model.Candidate, cause error,
+) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	ids := make([]int64, len(jobs))
+	tokens := make([]string, len(jobs))
+	for index, job := range jobs {
+		ids[index], tokens[index] = job.QueueID, job.ClaimToken
+	}
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE account_queue AS queue
+		SET status='rest_fallback', claimed_at=NULL, claim_token=NULL,
+		    lease_expires_at=NULL, next_attempt_at=now(),
+		    last_error=$3, last_error_at=now()
+		FROM unnest($1::bigint[], $2::text[]) AS claimed(id, token)
+		WHERE queue.id=claimed.id AND queue.claim_token::text=claimed.token
+	`, ids, tokens, cause.Error())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(jobs)) {
+		return fmt.Errorf(
+			"stale REST fallback claims: moved %d of %d",
+			tag.RowsAffected(), len(jobs),
+		)
+	}
+	return nil
+}
+
+func (s *Store) ClaimRESTFallback(ctx context.Context) (*model.Candidate, error) {
+	var job model.Candidate
+	err := s.Pool.QueryRow(ctx, `
+		WITH picked AS (
+		  SELECT id FROM account_queue
+		  WHERE status='rest_fallback' AND next_attempt_at <= now()
+		  ORDER BY next_attempt_at, id
+		  FOR UPDATE SKIP LOCKED
+		  LIMIT 1
+		)
+		UPDATE account_queue AS queue
+		SET status='rest_fallback_running', fallback_attempts=fallback_attempts+1,
+		    claimed_at=now(), lease_expires_at=now()+interval '2 hours',
+		    claim_token=gen_random_uuid(), last_error=NULL, last_error_at=NULL
+		FROM picked WHERE queue.id=picked.id
+		RETURNING queue.id, queue.run_id, queue.source, queue.github_id,
+		          queue.node_id, queue.login, queue.scan_id::text, queue.attempts,
+		          queue.fallback_attempts, queue.claim_token::text,
+		          queue.coverage_generation_id, queue.coverage_partition_id
+	`).Scan(
+		&job.QueueID, &job.RunID, &job.Source, &job.GitHubID,
+		&job.NodeID, &job.Login, &job.ScanID, &job.Attempts,
+		&job.FallbackAttempts, &job.ClaimToken,
+		&job.GenerationID, &job.PartitionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (s *Store) RequeueRESTFallbackAfter(
+	ctx context.Context, job model.Candidate, cause error, delay time.Duration,
+) error {
+	if delay <= 0 {
+		delay = min(
+			time.Duration(1<<min(max(job.FallbackAttempts, 1)-1, 12))*5*time.Second,
+			6*time.Hour,
+		)
+	}
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE account_queue
+		SET status='rest_fallback', claimed_at=NULL, claim_token=NULL,
+		    lease_expires_at=NULL, next_attempt_at=now()+$3::interval,
+		    last_error=$4, last_error_at=now()
+		WHERE id=$1 AND claim_token::text=$2
+	`, job.QueueID, job.ClaimToken, pgInterval(delay), cause.Error())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("stale REST fallback retry claim")
 	}
 	return nil
 }
@@ -2616,10 +2699,15 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (int64, error) {
 	err := s.Pool.QueryRow(ctx, `
 		WITH accounts AS (
 		  UPDATE account_queue SET
-		    status='retry', claimed_at=NULL, claim_token=NULL,
+		    status=CASE
+		      WHEN status='rest_fallback_running' THEN 'rest_fallback'
+		      ELSE 'retry'
+		    END,
+		    claimed_at=NULL, claim_token=NULL,
 		    lease_expires_at=NULL, next_attempt_at=now(),
 		    last_error='claim lease expired', last_error_at=now()
-		  WHERE status='running' AND lease_expires_at < now()
+		  WHERE status IN ('running','rest_fallback_running')
+		    AND lease_expires_at < now()
 		  RETURNING 1
 		), overflow AS (
 		  UPDATE overflow_queue SET
@@ -2645,7 +2733,8 @@ func (s *Store) DueWorkHealth(
 		SELECT
 		  EXISTS (
 		    SELECT 1 FROM account_queue
-		    WHERE status IN ('pending','retry') AND next_attempt_at <= now()
+		    WHERE status IN ('pending','retry','rest_fallback')
+		      AND next_attempt_at <= now()
 		    LIMIT 1
 		  ) OR EXISTS (
 		    SELECT 1 FROM overflow_queue
@@ -2659,7 +2748,9 @@ func (s *Store) DueWorkHealth(
 	if err := s.Pool.QueryRow(ctx, `
 		SELECT
 		  MAX(last_success_at) FILTER (WHERE name LIKE 'graphql-%'),
-		  MAX(last_success_at) FILTER (WHERE name LIKE 'rest-enumerator-%')
+		  MAX(last_success_at) FILTER (
+		    WHERE name LIKE 'rest-enumerator-%' OR name LIKE 'rest-fallback-%'
+		  )
 		FROM crawler_workers
 	`).Scan(&graphQLSuccess, &restSuccess); err != nil {
 		return false, nil, nil, err
@@ -2684,7 +2775,7 @@ func (s *Store) ClaimOverflow(ctx context.Context) (*model.OverflowJob, error) {
 		)
 		UPDATE overflow_queue AS q
 		SET status = 'running', attempts = attempts + 1,
-		    claimed_at = now(), lease_expires_at = now() + interval '5 minutes',
+		    claimed_at = now(), lease_expires_at = now() + interval '2 hours',
 		    claim_token = gen_random_uuid(),
 		    last_error = NULL, last_error_at = NULL
 		FROM picked
@@ -2911,6 +3002,68 @@ func (s *Store) CompleteOverflowPageScheduled(
 	return tx.Commit(ctx)
 }
 
+// CompleteOverflowFromREST replaces an unfinished GraphQL pagination scan with
+// one complete, identity-verified REST snapshot. The account was already
+// counted when overflow was created, so this finalizes coverage without
+// incrementing the crawl-run counters a second time.
+func (s *Store) CompleteOverflowFromREST(
+	ctx context.Context,
+	job model.OverflowJob,
+	result *model.UserResult,
+	ownerSchedule []time.Duration,
+) error {
+	if result == nil || result.GitHubID != job.GitHubID || result.NodeID == "" ||
+		result.Login == "" || result.CreatedAt.IsZero() {
+		return errors.New("invalid REST overflow result identity")
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, job.GitHubID); err != nil {
+		return err
+	}
+	candidate := model.Candidate{
+		GitHubID: job.GitHubID, NodeID: result.NodeID, Login: result.Login,
+		ScanID: job.ScanID,
+	}
+	if err := upsertOwner(
+		ctx, tx, candidate, result.Login, scheduleDuration(ownerSchedule, 0),
+	); err != nil {
+		return err
+	}
+	for _, key := range result.Keys {
+		if err := observeKey(ctx, tx, job.GitHubID, job.ScanID, key); err != nil {
+			return err
+		}
+	}
+	if err := finalizeObservation(ctx, tx, job.GitHubID, job.ScanID, ownerSchedule); err != nil {
+		return err
+	}
+	createdAt := result.CreatedAt
+	job.CreatedAt = &createdAt
+	job.NodeID, job.Login = result.NodeID, result.Login
+	if err := completeOverflowCoverageTx(ctx, tx, job); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM overflow_queue WHERE id=$1 AND claim_token::text=$2
+	`, job.ID, job.ClaimToken)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("stale overflow claim during REST completion")
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM key_scan_attempts WHERE scan_id=$1::uuid
+	`, job.ScanID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func completeOverflowCoverageTx(ctx context.Context, tx pgx.Tx, job model.OverflowJob) error {
 	generationID := job.GenerationID
 	if generationID == nil && job.RunID != nil {
@@ -3020,9 +3173,6 @@ func (s *Store) RequeueOverflow(ctx context.Context, job model.OverflowJob, caus
 func (s *Store) RequeueOverflowAfter(
 	ctx context.Context, job model.OverflowJob, cause error, delay time.Duration,
 ) error {
-	if job.Attempts >= 8 {
-		return s.quarantineOverflow(ctx, job, cause)
-	}
 	if delay <= 0 {
 		exponent := min(max(job.Attempts, 1)-1, 12)
 		delay = min(time.Duration(1<<exponent)*5*time.Second, 6*time.Hour)
@@ -3141,11 +3291,12 @@ func (s *Store) MaybeCompleteMain(ctx context.Context) (bool, error) {
 	if run.ProcessedUsers < run.EnumeratedUsers {
 		return false, nil
 	}
-	var overflowPending bool
+	var overflowPending, anomaliesPending bool
 	err = s.Pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM overflow_queue WHERE run_id=$1)
-	`, run.ID).Scan(&overflowPending)
-	if err != nil || overflowPending {
+		SELECT EXISTS (SELECT 1 FROM overflow_queue WHERE run_id=$1),
+		       EXISTS (SELECT 1 FROM scan_anomalies WHERE run_id=$1)
+	`, run.ID).Scan(&overflowPending, &anomaliesPending)
+	if err != nil || overflowPending || anomaliesPending {
 		return false, err
 	}
 	tx, err := s.Pool.Begin(ctx)
@@ -3630,6 +3781,14 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	rows.Close()
+	var unresolvedRunAnomalies int64
+	if len(runs) > 0 {
+		if err := s.Pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM scan_anomalies WHERE run_id=$1
+		`, runs[0].ID).Scan(&unresolvedRunAnomalies); err != nil {
+			return nil, err
+		}
+	}
 	shardStatus := map[string]any{
 		"count":     0,
 		"completed": 0,
@@ -3689,7 +3848,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	queueRows, err := s.Pool.Query(ctx, `
 		SELECT source, status, COUNT(*)
 		FROM account_queue
-		WHERE status IN ('running', 'retry')
+		WHERE status IN ('running', 'retry', 'rest_fallback', 'rest_fallback_running')
 		GROUP BY source, status
 		ORDER BY source, status
 	`)
@@ -3714,17 +3873,22 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	queueRows.Close()
+	var restFallbackJobs int64
+	for _, states := range queueBreakdown {
+		restFallbackJobs += states["rest_fallback"] + states["rest_fallback_running"]
+	}
 	var retryingJobs, runningJobs int64
 	var maximumAttempts int
 	var oldestJobAt *time.Time
 	if err := s.Pool.QueryRow(ctx, `
 		SELECT
-		  COUNT(*) FILTER (WHERE status = 'retry'),
-		  COUNT(*) FILTER (WHERE status = 'running'),
+		  COUNT(*) FILTER (WHERE status IN ('retry','rest_fallback')),
+		  COUNT(*) FILTER (WHERE status IN ('running','rest_fallback_running')),
 		  COALESCE(MAX(attempts), 0)
 		FROM (
-		  SELECT status, attempts FROM account_queue
-		  WHERE status IN ('running', 'retry')
+		  SELECT status, GREATEST(attempts, fallback_attempts) AS attempts
+		  FROM account_queue
+		  WHERE status IN ('running', 'retry', 'rest_fallback', 'rest_fallback_running')
 		  UNION ALL
 		  SELECT status, attempts FROM overflow_queue
 		  WHERE status IN ('running', 'retry')
@@ -3750,7 +3914,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		SELECT last_error, last_error_at
 		FROM (
 		  SELECT last_error, last_error_at FROM account_queue
-		  WHERE status = 'retry' AND last_error IS NOT NULL
+		  WHERE status IN ('retry','rest_fallback') AND last_error IS NOT NULL
 		  UNION ALL
 		  SELECT last_error, last_error_at FROM overflow_queue
 		  WHERE status = 'retry' AND last_error IS NOT NULL
@@ -3860,18 +4024,22 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var rollingOneHourAttempts, rollingSixHourAttempts float64
 	if err := s.Pool.QueryRow(ctx, `
 		WITH one_hour AS (
-		  SELECT MIN(sampled_at) AS first_at, MAX(sampled_at) AS last_at,
-		         MIN(processed_users) AS first_value,
-		         MAX(processed_users) AS last_value,
-		         MIN(attempted_users) AS first_attempted,
-		         MAX(attempted_users) AS last_attempted
+		  SELECT
+		    (array_agg(sampled_at ORDER BY sampled_at))[1] AS first_at,
+		    (array_agg(sampled_at ORDER BY sampled_at DESC))[1] AS last_at,
+		    (array_agg(processed_users ORDER BY sampled_at))[1] AS first_value,
+		    (array_agg(processed_users ORDER BY sampled_at DESC))[1] AS last_value,
+		    (array_agg(attempted_users ORDER BY sampled_at))[1] AS first_attempted,
+		    (array_agg(attempted_users ORDER BY sampled_at DESC))[1] AS last_attempted
 		  FROM crawler_rate_samples WHERE sampled_at >= now()-interval '1 hour'
 		), six_hours AS (
-		  SELECT MIN(sampled_at) AS first_at, MAX(sampled_at) AS last_at,
-		         MIN(processed_users) AS first_value,
-		         MAX(processed_users) AS last_value,
-		         MIN(attempted_users) AS first_attempted,
-		         MAX(attempted_users) AS last_attempted
+		  SELECT
+		    (array_agg(sampled_at ORDER BY sampled_at))[1] AS first_at,
+		    (array_agg(sampled_at ORDER BY sampled_at DESC))[1] AS last_at,
+		    (array_agg(processed_users ORDER BY sampled_at))[1] AS first_value,
+		    (array_agg(processed_users ORDER BY sampled_at DESC))[1] AS last_value,
+		    (array_agg(attempted_users ORDER BY sampled_at))[1] AS first_attempted,
+		    (array_agg(attempted_users ORDER BY sampled_at DESC))[1] AS last_attempted
 		  FROM crawler_rate_samples WHERE sampled_at >= now()-interval '6 hours'
 		)
 		SELECT
@@ -3903,6 +4071,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	}
 	progress := map[string]any{
 		"phase":                     "starting",
+		"rest_fallback_users":       restFallbackJobs,
 		"percentage":                nil,
 		"percentage_available_when": "account enumeration for the active run is complete",
 	}
@@ -3915,7 +4084,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	}
 	if len(runs) > 0 {
 		active := runs[0]
-		attemptedUsers := max(active.AttemptedUsers, active.ProcessedUsers)
+		attemptedUsers := active.AttemptedUsers
 		unattemptedBacklog := max(int64(0), active.EnumeratedUsers-attemptedUsers)
 		settlementBacklog := max(int64(0), active.EnumeratedUsers-active.ProcessedUsers)
 		if active.Status == "running" {
@@ -3936,12 +4105,15 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		firstPassStatus["discovered_users"] = active.EnumeratedUsers
 		firstPassStatus["attempted_users"] = attemptedUsers
 		firstPassStatus["settled_users"] = active.ProcessedUsers
+		firstPassStatus["unresolved_anomalies"] = unresolvedRunAnomalies
 		firstPassStatus["unattempted_discovered_users"] = unattemptedBacklog
 		firstPassStatus["unsettled_users"] = settlementBacklog
 		firstPassStatus["complete"] = active.EnumerationComplete &&
-			attemptedUsers >= active.EnumeratedUsers
+			active.ProcessedUsers >= active.EnumeratedUsers &&
+			unresolvedRunAnomalies == 0
 		firstPassStatus["settled"] = active.EnumerationComplete &&
-			active.ProcessedUsers >= active.EnumeratedUsers
+			active.ProcessedUsers >= active.EnumeratedUsers &&
+			unresolvedRunAnomalies == 0
 		elapsed := time.Since(active.StartedAt).Hours()
 		if active.CompletedAt != nil {
 			elapsed = active.CompletedAt.Sub(active.StartedAt).Hours()
@@ -3963,35 +4135,32 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			progress["rolling_6h_users_per_hour"] = rollingSixHours
 			progress["rolling_1h_attempts_per_hour"] = rollingOneHourAttempts
 			progress["rolling_6h_attempts_per_hour"] = rollingSixHourAttempts
-			etaRate := sessionUsersPerHour
-			rateBasis := "current GraphQL account-attempt rate"
-			if rollingOneHourAttempts > 0 {
-				etaRate = rollingOneHourAttempts
-				rateBasis = "persisted rolling one-hour account-attempt rate"
-			} else if rollingSixHourAttempts > 0 {
-				etaRate = rollingSixHourAttempts
-				rateBasis = "persisted rolling six-hour account-attempt rate"
+			etaRate := rollingOneHour
+			rateBasis := "persisted rolling one-hour settled-account rate"
+			if etaRate <= 0 {
+				etaRate = rollingSixHours
+				rateBasis = "persisted rolling six-hour settled-account rate"
 			}
 			if etaRate <= 0 {
-				etaRate = wallClockAttemptAverage
-				rateBasis = "wall-clock account-attempt average since run start"
+				etaRate = wallClockAverage
+				rateBasis = "wall-clock settled-account average since run start"
 			}
 			if etaRate <= 0 {
-				etaRate = rollingOneHour
-				rateBasis = "settled-account rate until attempt samples are available"
+				etaRate = sessionUsersPerHour
+				rateBasis = "current GraphQL observation rate until settlement samples are available"
 			}
 			if etaRate > 0 {
 				lowTotal, highTotal := estimatedLow, estimatedHigh
 				basis := "planning population envelope"
-				lowRemaining := max(int64(0), lowTotal-attemptedUsers)
-				highRemaining := max(int64(0), highTotal-attemptedUsers)
+				lowRemaining := max(int64(0), lowTotal-active.ProcessedUsers)
+				highRemaining := max(int64(0), highTotal-active.ProcessedUsers)
 				lowHours := float64(lowRemaining) / etaRate
 				highHours := float64(highRemaining) / etaRate
 				if active.EnumerationComplete && active.EnumeratedUsers > 0 {
 					lowTotal = active.EnumeratedUsers
 					highTotal = active.EnumeratedUsers
 					basis = "exact users enumerated for this run"
-					lowRemaining = max(int64(0), lowTotal-attemptedUsers)
+					lowRemaining = max(int64(0), lowTotal-active.ProcessedUsers)
 					highRemaining = lowRemaining
 					lowHours = float64(lowRemaining) / etaRate
 					highHours = lowHours
@@ -4047,7 +4216,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			}
 		}
 		if active.EnumerationComplete && active.EnumeratedUsers > 0 {
-			percentage := 100 * float64(attemptedUsers) / float64(active.EnumeratedUsers)
+			percentage := 100 * float64(active.ProcessedUsers) / float64(active.EnumeratedUsers)
 			if percentage > 100 {
 				percentage = 100
 			}

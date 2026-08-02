@@ -96,6 +96,9 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	}
 	config := crawler.DefaultConfig()
 	config.Workers = envInt("GRAPHQL_WORKERS", config.Workers) * credentialCount
+	config.RESTFallbackWorkers = envInt(
+		"REST_FALLBACK_WORKERS", config.RESTFallbackWorkers,
+	) * credentialCount
 	config.QueueMax = envInt("QUEUE_MAX_ACCOUNTS", config.QueueMax)
 	config.RESTPerHour = envInt("REST_REQUESTS_PER_HOUR", config.RESTPerHour) * credentialCount
 	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour) * credentialCount

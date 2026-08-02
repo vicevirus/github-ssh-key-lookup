@@ -13,18 +13,19 @@ import (
 func TestNormalizeUsersRejectsReorderedNodes(t *testing.T) {
 	jobs := []model.Candidate{{GitHubID: 1, NodeID: "U_1"}}
 	nodes := []*githubapi.GraphQLUser{{TypeName: "User", ID: "U_2", DatabaseID: 2}}
-	if _, err := normalizeUsers(jobs, nodes); err == nil {
+	results, resultErrors, err := normalizeUsers(jobs, nodes)
+	if err != nil || len(results) != 1 || resultErrors[0] == nil {
 		t.Fatal("accepted reordered GraphQL node")
 	}
 }
 
 func TestNormalizeUsersPreservesNullNode(t *testing.T) {
 	jobs := []model.Candidate{{GitHubID: 1, NodeID: "U_1"}}
-	results, err := normalizeUsers(jobs, []*githubapi.GraphQLUser{nil})
+	results, resultErrors, err := normalizeUsers(jobs, []*githubapi.GraphQLUser{nil})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0] != nil {
+	if len(results) != 1 || results[0] != nil || resultErrors[0] != nil {
 		t.Fatalf("unexpected results: %#v", results)
 	}
 }
@@ -81,5 +82,47 @@ func TestNormalizeKeysRejectsPartialSnapshot(t *testing.T) {
 	keys, err := normalizeKeys([]githubapi.GraphQLKey{{Key: raw, Fingerprint: parsed.Text}})
 	if err != nil || len(keys) != 1 || keys[0].Type != "ssh-ed25519" {
 		t.Fatalf("valid key was rejected: %#v %v", keys, err)
+	}
+}
+
+func TestRepeatedGraphQLFailuresFallbackOnlyActuallyRetriedJobs(t *testing.T) {
+	jobs := []model.Candidate{
+		{GitHubID: 1, Attempts: 3},
+		{GitHubID: 2, Attempts: 1},
+		{GitHubID: 3, Attempts: 4},
+	}
+	fallback, retry := splitFailedGraphQLBatch(jobs, errors.New("HTTP 504"))
+	if len(fallback) != 2 || fallback[0].GitHubID != 1 || fallback[1].GitHubID != 3 {
+		t.Fatalf("unexpected fallback partition: %#v", fallback)
+	}
+	if len(retry) != 1 || retry[0].GitHubID != 2 {
+		t.Fatalf("unexpected retry partition: %#v", retry)
+	}
+	limited := &githubapi.RateLimitError{Wait: time.Minute}
+	fallback, retry = splitFailedGraphQLBatch(jobs, limited)
+	if len(fallback) != 0 || len(retry) != len(jobs) {
+		t.Fatalf("rate-limited jobs escaped GraphQL pacing: fallback=%#v retry=%#v", fallback, retry)
+	}
+}
+
+func TestNormalizeRESTKeysCalculatesAndDeduplicatesFingerprints(t *testing.T) {
+	raw := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"
+	keys, err := normalizeRESTKeys([]string{raw})
+	if err != nil || len(keys) != 1 || keys[0].Text == "" {
+		t.Fatalf("valid REST key was rejected: %#v %v", keys, err)
+	}
+	if _, err := normalizeRESTKeys([]string{raw, raw + " comment"}); err == nil {
+		t.Fatal("duplicate REST fingerprint was accepted")
+	}
+}
+
+func TestSameKeySetIgnoresPaginationOrderButDetectsDrift(t *testing.T) {
+	left := []model.PublicKey{{Text: "SHA256:a"}, {Text: "SHA256:b"}}
+	right := []model.PublicKey{{Text: "SHA256:b"}, {Text: "SHA256:a"}}
+	if !sameKeySet(left, right) {
+		t.Fatal("equal key sets with different order were rejected")
+	}
+	if sameKeySet(left, []model.PublicKey{{Text: "SHA256:a"}, {Text: "SHA256:c"}}) {
+		t.Fatal("changed key set was accepted")
 	}
 }

@@ -369,6 +369,92 @@ func TestClaimLeasesRejectStaleWorkersAndHonorRetryDueTime(t *testing.T) {
 	}
 }
 
+func TestRESTFallbackClaimsAreDurableAndExcludedFromGraphQL(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	candidate := model.Candidate{GitHubID: 771, NodeID: "U_771", Login: "fallback"}
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("GraphQL claim: jobs=%#v err=%v", jobs, err)
+	}
+	if err := database.MoveAccountsToRESTFallback(ctx, jobs, errors.New("null node")); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("REST fallback leaked into GraphQL lane: jobs=%#v err=%v", jobs, err)
+	}
+	fallback, err := database.ClaimRESTFallback(ctx)
+	if err != nil || fallback.GitHubID != candidate.GitHubID || fallback.FallbackAttempts != 1 {
+		t.Fatalf("REST fallback claim: job=%#v err=%v", fallback, err)
+	}
+	if err := database.RequeueRESTFallbackAfter(
+		ctx, *fallback, errors.New("temporary REST error"), time.Hour,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ClaimRESTFallback(ctx); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("future REST retry was claimed early: %v", err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue
+		SET next_attempt_at=now()-interval '1 second'
+		WHERE github_id=$1
+	`, candidate.GitHubID); err != nil {
+		t.Fatal(err)
+	}
+	fallback, err = database.ClaimRESTFallback(ctx)
+	if err != nil || fallback.FallbackAttempts != 2 {
+		t.Fatalf("second REST fallback claim: job=%#v err=%v", fallback, err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue SET lease_expires_at=now()-interval '1 second'
+		WHERE id=$1
+	`, fallback.QueueID); err != nil {
+		t.Fatal(err)
+	}
+	if reaped, err := database.ReapExpiredLeases(ctx); err != nil || reaped != 1 {
+		t.Fatalf("reap REST fallback: count=%d err=%v", reaped, err)
+	}
+	recovered, err := database.ClaimRESTFallback(ctx)
+	if err != nil || recovered.FallbackAttempts != 3 {
+		t.Fatalf("recovered REST fallback claim: job=%#v err=%v", recovered, err)
+	}
+}
+
+func TestMainRunCannotCompleteWithAnUnresolvedAnomaly(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	var runID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO crawl_runs (
+		  kind, next_url, enumeration_complete, enumerated_users, processed_users
+		) VALUES ('initial', 'https://api.github.com/users?since=1', true, 1, 1)
+		RETURNING id
+	`).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		INSERT INTO scan_anomalies (
+		  github_id, node_id, login, run_id, kind, next_attempt_at, last_error
+		) VALUES (991, 'U_991', 'unresolved', $1, 'test', now(), 'test')
+	`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if completed, err := database.MaybeCompleteMain(ctx); err != nil || completed {
+		t.Fatalf("run completed across unresolved anomaly: completed=%t err=%v", completed, err)
+	}
+	if _, err := database.Pool.Exec(ctx, `DELETE FROM scan_anomalies WHERE run_id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if completed, err := database.MaybeCompleteMain(ctx); err != nil || !completed {
+		t.Fatalf("settled run did not complete: completed=%t err=%v", completed, err)
+	}
+}
+
 func TestDueRetryPrecedesPendingWork(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
@@ -503,7 +589,7 @@ func TestRunCounterLockDoesNotConflictWithQueueForeignKeys(t *testing.T) {
 	}
 }
 
-func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.T) {
+func TestPersistentOverflowFailureRemainsDurableWithoutPublishingKeys(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()
 	candidate := model.Candidate{GitHubID: 88, NodeID: "U_88", Login: "unstable"}
@@ -547,9 +633,9 @@ func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.
 	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM key_scan_attempts`).Scan(&scanRows); err != nil {
 		t.Fatal(err)
 	}
-	if anomalies != 1 || overflowRows != 0 || scanRows != 0 {
+	if anomalies != 0 || overflowRows != 1 || scanRows != 1 {
 		t.Fatalf(
-			"bad overflow quarantine state: anomalies=%d overflow=%d scans=%d",
+			"bad durable overflow retry state: anomalies=%d overflow=%d scans=%d",
 			anomalies, overflowRows, scanRows,
 		)
 	}
@@ -559,6 +645,57 @@ func TestPersistentOverflowFailureIsQuarantinedWithoutPublishingKeys(t *testing.
 	}
 	if len(matches) != 0 {
 		t.Fatalf("unverified overflow key became visible: %#v", matches)
+	}
+}
+
+func TestRESTOverflowCompletionPublishesOnlyTheFullSnapshot(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	candidate := model.Candidate{GitHubID: 881, NodeID: "U_881", Login: "large"}
+	firstKey := parsedTestKey(t, 21)
+	secondKey := parsedTestKey(t, 22)
+	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 1, "live")
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("claim: jobs=%#v err=%v", jobs, err)
+	}
+	if err := database.CompleteAccounts(ctx, jobs, []*model.UserResult{{
+		NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+		Login: candidate.Login, CreatedAt: time.Now().Add(-time.Hour),
+		Keys: []model.PublicKey{firstKey}, HasMoreKeys: true,
+		NextCursor: "cursor-100", TotalKeyCount: 101,
+	}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	overflow, err := database.ClaimOverflow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().Add(-24 * time.Hour).UTC()
+	if err := database.CompleteOverflowFromREST(ctx, *overflow, &model.UserResult{
+		NodeID: candidate.NodeID, GitHubID: candidate.GitHubID,
+		Login: candidate.Login, CreatedAt: createdAt,
+		Keys: []model.PublicKey{firstKey, secondKey}, TotalKeyCount: 2,
+	}, []time.Duration{time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	var overflowRows, scanRows int
+	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM overflow_queue`).Scan(&overflowRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM key_scan_attempts`).Scan(&scanRows); err != nil {
+		t.Fatal(err)
+	}
+	if overflowRows != 0 || scanRows != 0 {
+		t.Fatalf("REST overflow cleanup incomplete: overflow=%d scans=%d", overflowRows, scanRows)
+	}
+	for _, key := range []model.PublicKey{firstKey, secondKey} {
+		matches, err := database.Lookup(ctx, key.Text)
+		if err != nil || len(matches) != 1 || matches[0].GitHubID != candidate.GitHubID {
+			t.Fatalf("REST overflow key missing: key=%s matches=%#v err=%v", key.Text, matches, err)
+		}
 	}
 }
 

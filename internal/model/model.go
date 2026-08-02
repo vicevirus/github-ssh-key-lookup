@@ -3,17 +3,18 @@ package model
 import "time"
 
 type Candidate struct {
-	QueueID      int64
-	Attempts     int
-	RunID        *int64
-	Source       string
-	GitHubID     int64
-	NodeID       string
-	Login        string
-	ScanID       string
-	ClaimToken   string
-	GenerationID *int64
-	PartitionID  *int64
+	QueueID          int64
+	Attempts         int
+	FallbackAttempts int
+	RunID            *int64
+	Source           string
+	GitHubID         int64
+	NodeID           string
+	Login            string
+	ScanID           string
+	ClaimToken       string
+	GenerationID     *int64
+	PartitionID      *int64
 }
 
 type PublicKey struct {

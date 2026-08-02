@@ -18,8 +18,10 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 		"progress": map[string]any{
 			"phase": "initial_scan", "enumerated_users": int64(1000),
 			"attempted_users": int64(750), "processed_users": int64(700),
-			"processing_backlog":   int64(300),
-			"enumeration_complete": false, "remaining_id_positions": int64(500),
+			"processing_backlog":           int64(300),
+			"rest_fallback_users":          int64(25),
+			"rolling_1h_attempts_per_hour": 390.0,
+			"enumeration_complete":         false, "remaining_id_positions": int64(500),
 			"current_enumeration_users_per_hour": 400.0,
 			"estimated_completion": map[string]any{
 				"rate_accounts_per_hour": 390.0,
@@ -69,11 +71,14 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {
 		t.Fatalf("missing compact progress: %#v", progress)
 	}
-	if progress["estimate_scope"] != "first pass: REST discovery plus first GraphQL observation" {
+	if progress["estimate_scope"] != "first pass: discovery plus settled GraphQL/REST key coverage" {
 		t.Fatalf("missing honest estimate scope: %#v", progress)
 	}
 	if progress["attempted_users"] != int64(750) || progress["attempt_rate_per_hour"] != 390.0 {
 		t.Fatalf("missing first-attempt progress: %#v", progress)
+	}
+	if progress["rest_fallback_users"] != int64(25) {
+		t.Fatalf("missing REST fallback backlog: %#v", progress)
 	}
 	if progress["estimate_preliminary"] != true {
 		t.Fatalf("missing estimate warm-up state: %#v", progress)

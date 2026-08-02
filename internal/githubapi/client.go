@@ -92,6 +92,14 @@ type UsersPage struct {
 	Elapsed     time.Duration
 }
 
+type PublicKeysPage struct {
+	Keys     []string
+	NextURL  string
+	NotFound bool
+	Rate     model.Rate
+	Elapsed  time.Duration
+}
+
 type UserSearchCount struct {
 	TotalCount        int64
 	IncompleteResults bool
@@ -394,6 +402,59 @@ func (c *Client) GetUserByID(ctx context.Context, githubID int64) (*RESTUser, mo
 		return nil, rate, fmt.Errorf("GitHub user-by-ID mismatch: requested %d, received %d", githubID, user.ID)
 	}
 	return &user, rate, nil
+}
+
+func (c *Client) PublicKeysURL(login string) string {
+	return fmt.Sprintf(
+		"%s/users/%s/keys?per_page=100",
+		strings.TrimRight(c.RESTBase, "/"), url.PathEscape(login),
+	)
+}
+
+// ListPublicKeys fetches one page of a user's verified public Git SSH
+// authentication keys. Signing-only keys intentionally use a different API.
+func (c *Client) ListPublicKeys(ctx context.Context, requestURL string) (PublicKeysPage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return PublicKeysPage{}, err
+	}
+	c.headers(req)
+	started := time.Now()
+	resp, err := c.do(req)
+	if err != nil {
+		return PublicKeysPage{}, err
+	}
+	defer resp.Body.Close()
+	page := PublicKeysPage{
+		Rate: rateFromHeaders(resp.Header), Elapsed: time.Since(started),
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		page.NotFound = true
+		return page, nil
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return PublicKeysPage{}, rateError(resp)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return PublicKeysPage{}, &AuthenticationError{Status: resp.StatusCode, Body: string(body)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return PublicKeysPage{}, fmt.Errorf("GitHub public-keys HTTP %d: %s", resp.StatusCode, body)
+	}
+	var body []struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return PublicKeysPage{}, fmt.Errorf("decode GitHub public keys: %w", err)
+	}
+	page.Keys = make([]string, len(body))
+	for index := range body {
+		page.Keys[index] = body[index].Key
+	}
+	page.NextURL = nextLink(resp.Header.Get("Link"))
+	return page, nil
 }
 
 func (c *Client) FetchUsers(ctx context.Context, ids []string) (UsersAndKeys, error) {
