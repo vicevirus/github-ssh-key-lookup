@@ -166,6 +166,11 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	remainingHoursHigh := math.Max(restHoursHigh, graphqlHoursHigh)
 	fastScanHoursLow := math.Max(fastScanRESTHoursLow, fastScanGraphQLHoursLow)
 	fastScanHoursHigh := math.Max(fastScanRESTHoursHigh, fastScanGraphQLHoursHigh)
+	// Settlement includes the fast scan. Resource repair can drain concurrently
+	// and may finish before discovery, but full negative-lookup coverage cannot
+	// be complete before every account has received its initial GraphQL attempt.
+	remainingHoursLow = math.Max(remainingHoursLow, fastScanHoursLow)
+	remainingHoursHigh = math.Max(remainingHoursHigh, fastScanHoursHigh)
 	remainingAccountsLow := settlementBacklog + futureLow
 	remainingAccountsHigh := settlementBacklog + futureHigh
 	effectiveUsersPerHour := 0.0

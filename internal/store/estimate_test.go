@@ -48,6 +48,10 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 	if estimate.FastScanHoursHigh <= estimate.FastScanHoursLow || estimate.FastScanHoursHigh > 95 {
 		t.Fatalf("unexpected conservative fast-scan estimate: %#v", estimate)
 	}
+	if estimate.RemainingHoursLow < estimate.FastScanHoursLow ||
+		estimate.RemainingHoursHigh < estimate.FastScanHoursHigh {
+		t.Fatalf("settled coverage cannot predate the fast scan: %#v", estimate)
+	}
 }
 
 func TestEstimatePhasedCompletionUsesBatchedResourceRepairAfterEnumeration(t *testing.T) {
