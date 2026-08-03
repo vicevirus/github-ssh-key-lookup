@@ -3965,6 +3965,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var enumerationStartedAt *time.Time
 	var enumerationLastSuccessAt *time.Time
 	var enumerationProcessedUsers int64
+	var enumerationRequests int64
+	var graphQLRequests int64
+	var restFallbackProcessedUsers int64
+	var restFallbackRequests int64
 	for index := range workers {
 		worker := workers[index]
 		if latestHeartbeat == nil || worker.HeartbeatAt.After(*latestHeartbeat) {
@@ -3984,6 +3988,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		switch worker.Role {
 		case "SSH key batch worker":
 			sessionProcessedUsers += worker.ProcessedUsers
+			graphQLRequests += worker.Requests
 			if sessionStartedAt == nil || worker.StartedAt.Before(*sessionStartedAt) {
 				value := worker.StartedAt
 				sessionStartedAt = &value
@@ -3995,6 +4000,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			}
 		case "parallel global account enumeration":
 			enumerationProcessedUsers += worker.ProcessedUsers
+			enumerationRequests += worker.Requests
 			if enumerationStartedAt == nil || worker.StartedAt.Before(*enumerationStartedAt) {
 				value := worker.StartedAt
 				enumerationStartedAt = &value
@@ -4004,6 +4010,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				value := *worker.LastSuccessAt
 				enumerationLastSuccessAt = &value
 			}
+		case "identity-safe REST key fallback":
+			restFallbackProcessedUsers += worker.ProcessedUsers
+			restFallbackRequests += worker.Requests
 		}
 	}
 	var sessionUsersPerHour float64
@@ -4068,6 +4077,22 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	}
 	if estimatedHigh < estimatedLow {
 		estimatedHigh = 220_000_000
+	}
+	pacing := make(map[string]any)
+	pacerConfiguredPerHour := make(map[string]float64)
+	for _, resource := range []string{"rest", "graphql"} {
+		raw, _ := s.State(ctx, resource+"_pacer")
+		if raw == "" {
+			continue
+		}
+		var value map[string]any
+		if json.Unmarshal([]byte(raw), &value) != nil {
+			continue
+		}
+		pacing[resource] = value
+		if configured, ok := value["configured_per_hour"].(float64); ok {
+			pacerConfiguredPerHour[resource] = configured
+		}
 	}
 	progress := map[string]any{
 		"phase":                     "starting",
@@ -4135,6 +4160,17 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			progress["rolling_6h_users_per_hour"] = rollingSixHours
 			progress["rolling_1h_attempts_per_hour"] = rollingOneHourAttempts
 			progress["rolling_6h_attempts_per_hour"] = rollingSixHourAttempts
+			stage := "enumerating"
+			switch {
+			case active.EnumerationComplete && settlementBacklog == 0:
+				stage = "complete"
+			case unattemptedBacklog > 0:
+				stage = "graphql_indexing"
+			case settlementBacklog > 0:
+				stage = "rest_fallback_drain"
+			}
+			progress["stage"] = stage
+
 			etaRate := rollingOneHour
 			rateBasis := "persisted rolling one-hour settled-account rate"
 			if etaRate <= 0 {
@@ -4149,7 +4185,91 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				etaRate = sessionUsersPerHour
 				rateBasis = "current GraphQL observation rate until settlement samples are available"
 			}
-			if etaRate > 0 {
+
+			enumerationUsersPerRequest := 0.0
+			if enumerationRequests > 0 {
+				enumerationUsersPerRequest = float64(enumerationProcessedUsers) /
+					float64(enumerationRequests)
+			}
+			graphqlUsersPerRequest := 0.0
+			if graphQLRequests > 0 {
+				graphqlUsersPerRequest = float64(sessionProcessedUsers) /
+					float64(graphQLRequests)
+			}
+			restRequestsPerFallback := 0.0
+			if restFallbackProcessedUsers > 0 {
+				restRequestsPerFallback = float64(restFallbackRequests) /
+					float64(restFallbackProcessedUsers)
+			}
+
+			phased, phaseOK := estimatePhasedCompletion(phaseEstimateInput{
+				EnumerationComplete:        active.EnumerationComplete,
+				EnumeratedUsers:            active.EnumeratedUsers,
+				AttemptedUsers:             attemptedUsers,
+				ProcessedUsers:             active.ProcessedUsers,
+				InaccessibleUsers:          active.InaccessibleUsers,
+				RESTFallbackUsers:          restFallbackJobs,
+				RemainingShardIDs:          remainingShardIDs,
+				ObservedShardIDs:           observedShardIDs,
+				ObservedShardUsers:         observedShardUsers,
+				EstimatedLow:               estimatedLow,
+				EstimatedHigh:              estimatedHigh,
+				RESTPerHour:                pacerConfiguredPerHour["rest"],
+				GraphQLPerHour:             pacerConfiguredPerHour["graphql"],
+				EnumerationUsersPerRequest: enumerationUsersPerRequest,
+				GraphQLUsersPerRequest:     graphqlUsersPerRequest,
+				RESTRequestsPerFallback:    restRequestsPerFallback,
+			})
+			if phaseOK {
+				estimate := map[string]any{
+					"basis":                              phased.Basis,
+					"rate_basis":                         phased.RateBasis,
+					"rate_accounts_per_hour":             phased.EffectiveUsersPerHour,
+					"rate_users_per_hour":                phased.EffectiveUsersPerHour,
+					"rate_is_preliminary":                phased.Preliminary,
+					"paused":                             activeWorkers == 0,
+					"estimated_total_low":                phased.EstimatedTotalLow,
+					"estimated_total_high":               phased.EstimatedTotalHigh,
+					"remaining_hours_low":                phased.RemainingHoursLow,
+					"remaining_hours_high":               phased.RemainingHoursHigh,
+					"estimated_finish_early":             now.Add(time.Duration(phased.RemainingHoursLow * float64(time.Hour))),
+					"estimated_finish_late":              now.Add(time.Duration(phased.RemainingHoursHigh * float64(time.Hour))),
+					"exact":                              active.EnumerationComplete,
+					"stage":                              stage,
+					"observed_rest_fallback_ratio":       phased.FallbackRatioLow,
+					"estimated_rest_fallback_ratio_high": phased.FallbackRatioHigh,
+					"enumeration_users_per_request":      phased.EnumerationUsersPerRequest,
+					"graphql_users_per_request":          phased.GraphQLUsersPerRequest,
+					"rest_requests_per_fallback":         phased.RESTRequestsPerFallback,
+					"rest_capacity_per_hour":             pacerConfiguredPerHour["rest"],
+					"graphql_capacity_per_hour":          pacerConfiguredPerHour["graphql"],
+					"remaining_rest_requests_low":        phased.RESTRequestsLow,
+					"remaining_rest_requests_high":       phased.RESTRequestsHigh,
+					"remaining_graphql_points_low":       phased.GraphQLPointsLow,
+					"remaining_graphql_points_high":      phased.GraphQLPointsHigh,
+					"rest_hours_low":                     phased.RESTHoursLow,
+					"rest_hours_high":                    phased.RESTHoursHigh,
+					"graphql_hours_low":                  phased.GraphQLHoursLow,
+					"graphql_hours_high":                 phased.GraphQLHoursHigh,
+				}
+				progress["remaining_id_positions"] = remainingShardIDs
+				if observedShardIDs > 0 {
+					progress["observed_users_per_id"] = float64(observedShardUsers) /
+						float64(observedShardIDs)
+				}
+				progress["estimated_future_users"] = phased.EstimatedFutureUsersLow
+				progress["estimated_completion"] = estimate
+				firstPassStatus["estimated_undiscovered_users"] = phased.EstimatedFutureUsersLow
+				firstPassStatus["estimated_undiscovered_users_high"] = phased.EstimatedFutureUsersHigh
+				firstPassStatus["estimated_total_users_low"] = phased.EstimatedTotalLow
+				firstPassStatus["estimated_total_users_high"] = phased.EstimatedTotalHigh
+				firstPassStatus["estimated_remaining_observations_low"] = phased.RemainingAccountsLow
+				firstPassStatus["estimated_remaining_observations_high"] = phased.RemainingAccountsHigh
+				firstPassStatus["attempt_rate_per_hour"] = phased.EffectiveUsersPerHour
+				firstPassStatus["estimated_finish_early"] = estimate["estimated_finish_early"]
+				firstPassStatus["estimated_finish_late"] = estimate["estimated_finish_late"]
+				firstPassStatus["estimate_basis"] = phased.Basis
+			} else if etaRate > 0 {
 				lowTotal, highTotal := estimatedLow, estimatedHigh
 				basis := "planning population envelope"
 				lowRemaining := max(int64(0), lowTotal-active.ProcessedUsers)
@@ -4170,8 +4290,8 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 					estimatedFutureUsers := int64(math.Ceil(float64(remainingShardIDs) * density))
 					lowTotal = active.EnumeratedUsers + estimatedFutureUsers
 					highTotal = active.EnumeratedUsers + remainingShardIDs
-					lowRemaining = unattemptedBacklog + estimatedFutureUsers
-					highRemaining = unattemptedBacklog + remainingShardIDs
+					lowRemaining = settlementBacklog + estimatedFutureUsers
+					highRemaining = settlementBacklog + remainingShardIDs
 					lowHours = float64(lowRemaining) / etaRate
 					highHours = float64(highRemaining) / etaRate
 					if enumerationUsersPerHour > 0 {
@@ -4246,17 +4366,6 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			age = 0
 		}
 		oldestJobAgeSeconds = &age
-	}
-	pacing := make(map[string]any)
-	for _, resource := range []string{"rest", "graphql"} {
-		raw, _ := s.State(ctx, resource+"_pacer")
-		if raw == "" {
-			continue
-		}
-		var value any
-		if json.Unmarshal([]byte(raw), &value) == nil {
-			pacing[resource] = value
-		}
 	}
 	schedulerAllocation, _ := s.State(ctx, "scheduler_allocation")
 	ownerSchedule, _ := s.State(ctx, "owner_refresh_schedule")

@@ -195,6 +195,7 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 		"crawler": map[string]any{
 			"online":            crawler["online"],
 			"phase":             progress["phase"],
+			"stage":             progress["stage"],
 			"active_workers":    crawler["active_workers"],
 			"last_heartbeat_at": crawler["last_heartbeat_at"],
 		},

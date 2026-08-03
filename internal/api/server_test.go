@@ -16,8 +16,9 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	snapshot := map[string]any{
 		"index": map[string]int64{"owners": 12, "keys": 34, "associations": 56},
 		"progress": map[string]any{
-			"phase": "initial_scan", "enumerated_users": int64(1000),
-			"attempted_users": int64(750), "processed_users": int64(700),
+			"phase": "initial_scan", "stage": "rest_fallback_drain",
+			"enumerated_users": int64(1000),
+			"attempted_users":  int64(750), "processed_users": int64(700),
 			"processing_backlog":           int64(300),
 			"rest_fallback_users":          int64(25),
 			"rolling_1h_attempts_per_hour": 390.0,
@@ -66,6 +67,10 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	}
 	if result["status"] != "running" {
 		t.Fatalf("unexpected status: %#v", result)
+	}
+	crawler := result["crawler"].(map[string]any)
+	if crawler["stage"] != "rest_fallback_drain" {
+		t.Fatalf("missing phase-aware crawler stage: %#v", crawler)
 	}
 	progress := result["progress"].(map[string]any)
 	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {

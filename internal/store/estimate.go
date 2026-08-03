@@ -1,0 +1,178 @@
+package store
+
+import "math"
+
+type phaseEstimateInput struct {
+	EnumerationComplete        bool
+	EnumeratedUsers            int64
+	AttemptedUsers             int64
+	ProcessedUsers             int64
+	InaccessibleUsers          int64
+	RESTFallbackUsers          int64
+	RemainingShardIDs          int64
+	ObservedShardIDs           int64
+	ObservedShardUsers         int64
+	EstimatedLow               int64
+	EstimatedHigh              int64
+	RESTPerHour                float64
+	GraphQLPerHour             float64
+	EnumerationUsersPerRequest float64
+	GraphQLUsersPerRequest     float64
+	RESTRequestsPerFallback    float64
+}
+
+type phaseEstimate struct {
+	Basis                      string
+	RateBasis                  string
+	EstimatedTotalLow          int64
+	EstimatedTotalHigh         int64
+	EstimatedFutureUsersLow    int64
+	EstimatedFutureUsersHigh   int64
+	RemainingAccountsLow       int64
+	RemainingAccountsHigh      int64
+	RemainingHoursLow          float64
+	RemainingHoursHigh         float64
+	EffectiveUsersPerHour      float64
+	FallbackRatioLow           float64
+	FallbackRatioHigh          float64
+	RESTRequestsLow            float64
+	RESTRequestsHigh           float64
+	GraphQLPointsLow           float64
+	GraphQLPointsHigh          float64
+	RESTHoursLow               float64
+	RESTHoursHigh              float64
+	GraphQLHoursLow            float64
+	GraphQLHoursHigh           float64
+	EnumerationUsersPerRequest float64
+	GraphQLUsersPerRequest     float64
+	RESTRequestsPerFallback    float64
+	Preliminary                bool
+}
+
+func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
+	if input.RESTPerHour <= 0 || input.GraphQLPerHour <= 0 {
+		return phaseEstimate{}, false
+	}
+
+	enumerationUsersPerRequest := boundedRate(
+		input.EnumerationUsersPerRequest, 1, 100, 90,
+	)
+	graphqlUsersPerRequest := boundedRate(
+		input.GraphQLUsersPerRequest, 1, 100, 100,
+	)
+	restRequestsPerFallback := boundedRate(
+		input.RESTRequestsPerFallback, 1, 10, 1,
+	)
+
+	settlementBacklog := max(int64(0), input.EnumeratedUsers-input.ProcessedUsers)
+	nonRESTBacklog := max(int64(0), settlementBacklog-input.RESTFallbackUsers)
+
+	futureLow, futureHigh := int64(0), int64(0)
+	basis := "exact users enumerated for this run"
+	preliminary := input.AttemptedUsers < 1_000_000
+	if !input.EnumerationComplete {
+		switch {
+		case input.RemainingShardIDs > 0 && input.ObservedShardIDs > 0:
+			density := clamp(
+				float64(input.ObservedShardUsers)/float64(input.ObservedShardIDs), 0, 1,
+			)
+			futureLow = int64(math.Ceil(float64(input.RemainingShardIDs) * density))
+			futureHigh = input.RemainingShardIDs
+			basis = "phase-aware API work from active shard density"
+			preliminary = preliminary || input.ObservedShardIDs < 1_000_000
+		default:
+			futureLow = max(int64(0), input.EstimatedLow-input.EnumeratedUsers)
+			futureHigh = max(futureLow, input.EstimatedHigh-input.EnumeratedUsers)
+			basis = "phase-aware API work from planning population envelope"
+			preliminary = true
+		}
+	}
+
+	// Every account already proven inaccessible consumed an identity-safe REST
+	// lookup. Accounts still in the fallback lane will consume at least one.
+	// Together they provide a durable, phase-independent lower-bound sample of
+	// how often future GraphQL observations will need REST verification.
+	fallbackSample := input.InaccessibleUsers + input.RESTFallbackUsers
+	fallbackRatioLow := 0.10
+	if input.AttemptedUsers > 0 {
+		fallbackRatioLow = clamp(
+			float64(fallbackSample)/float64(input.AttemptedUsers), 0.001, 1,
+		)
+	}
+	// The upper estimate covers accessible fallbacks, retry traffic, and drift
+	// in the remaining ranges without pretending that every account uses REST.
+	fallbackRatioHigh := clamp(
+		math.Max(fallbackRatioLow*1.20, fallbackRatioLow+0.02),
+		fallbackRatioLow, 1,
+	)
+
+	currentRESTRequests := float64(input.RESTFallbackUsers) * restRequestsPerFallback
+	currentGraphQLPoints := float64(nonRESTBacklog) / graphqlUsersPerRequest
+
+	restRequestsLow := currentRESTRequests +
+		float64(futureLow)/enumerationUsersPerRequest +
+		float64(futureLow)*fallbackRatioLow*restRequestsPerFallback
+	graphqlPointsLow := currentGraphQLPoints + float64(futureLow)/graphqlUsersPerRequest
+
+	// Ten percent operational overhead is kept on the late side only. The live
+	// pacers already reserve primary quota; this margin is for retries, key-page
+	// pagination, tail traffic, and API variance.
+	const highOverhead = 1.10
+	restRequestsHigh := (currentRESTRequests +
+		float64(futureHigh)/enumerationUsersPerRequest +
+		float64(futureHigh)*fallbackRatioHigh*restRequestsPerFallback) * highOverhead
+	graphqlPointsHigh := (currentGraphQLPoints +
+		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead
+
+	restHoursLow := restRequestsLow / input.RESTPerHour
+	restHoursHigh := restRequestsHigh / input.RESTPerHour
+	graphqlHoursLow := graphqlPointsLow / input.GraphQLPerHour
+	graphqlHoursHigh := graphqlPointsHigh / input.GraphQLPerHour
+	remainingHoursLow := math.Max(restHoursLow, graphqlHoursLow)
+	remainingHoursHigh := math.Max(restHoursHigh, graphqlHoursHigh)
+	remainingAccountsLow := settlementBacklog + futureLow
+	remainingAccountsHigh := settlementBacklog + futureHigh
+	effectiveUsersPerHour := 0.0
+	if remainingHoursLow > 0 {
+		effectiveUsersPerHour = float64(remainingAccountsLow) / remainingHoursLow
+	}
+
+	return phaseEstimate{
+		Basis:                      basis,
+		RateBasis:                  "phase-aware REST enumeration/fallback and GraphQL batch capacities",
+		EstimatedTotalLow:          input.EnumeratedUsers + futureLow,
+		EstimatedTotalHigh:         input.EnumeratedUsers + futureHigh,
+		EstimatedFutureUsersLow:    futureLow,
+		EstimatedFutureUsersHigh:   futureHigh,
+		RemainingAccountsLow:       remainingAccountsLow,
+		RemainingAccountsHigh:      remainingAccountsHigh,
+		RemainingHoursLow:          remainingHoursLow,
+		RemainingHoursHigh:         remainingHoursHigh,
+		EffectiveUsersPerHour:      effectiveUsersPerHour,
+		FallbackRatioLow:           fallbackRatioLow,
+		FallbackRatioHigh:          fallbackRatioHigh,
+		RESTRequestsLow:            restRequestsLow,
+		RESTRequestsHigh:           restRequestsHigh,
+		GraphQLPointsLow:           graphqlPointsLow,
+		GraphQLPointsHigh:          graphqlPointsHigh,
+		RESTHoursLow:               restHoursLow,
+		RESTHoursHigh:              restHoursHigh,
+		GraphQLHoursLow:            graphqlHoursLow,
+		GraphQLHoursHigh:           graphqlHoursHigh,
+		EnumerationUsersPerRequest: enumerationUsersPerRequest,
+		GraphQLUsersPerRequest:     graphqlUsersPerRequest,
+		RESTRequestsPerFallback:    restRequestsPerFallback,
+		Preliminary:                preliminary,
+	}, true
+}
+
+func boundedRate(value, low, high, fallback float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return fallback
+	}
+	return clamp(value, low, high)
+}
+
+func clamp(value, low, high float64) float64 {
+	return math.Max(low, math.Min(high, value))
+}
