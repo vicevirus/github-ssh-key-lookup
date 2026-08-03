@@ -3936,7 +3936,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var oldestJobAt *time.Time
 	if err := s.Pool.QueryRow(ctx, `
 		SELECT
-		  COUNT(*) FILTER (WHERE status IN ('retry','rest_fallback')),
+		  COUNT(*) FILTER (WHERE status = 'retry'),
 		  COUNT(*) FILTER (WHERE status IN ('running','rest_fallback_running')),
 		  COALESCE(MAX(attempts), 0)
 		FROM (

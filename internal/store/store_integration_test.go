@@ -855,8 +855,11 @@ func TestStatusIncludesWorkerActivity(t *testing.T) {
 	if err := database.SetState(ctx, "estimated_accounts_high", "3000"); err != nil {
 		t.Fatal(err)
 	}
-	candidate := model.Candidate{GitHubID: 99, NodeID: "U_99", Login: "retry-user"}
-	if _, err := database.Enqueue(ctx, "tail", []model.Candidate{candidate}); err != nil {
+	candidates := []model.Candidate{
+		{GitHubID: 99, NodeID: "U_99", Login: "retry-user"},
+		{GitHubID: 100, NodeID: "U_100", Login: "resource-user"},
+	}
+	if _, err := database.Enqueue(ctx, "tail", candidates); err != nil {
 		t.Fatal(err)
 	}
 	jobs, err := database.ClaimAccounts(ctx, 1, false)
@@ -864,6 +867,11 @@ func TestStatusIncludesWorkerActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := database.RequeueAccounts(ctx, jobs, errors.New("temporary test failure")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE account_queue SET status='rest_fallback' WHERE github_id=100
+	`); err != nil {
 		t.Fatal(err)
 	}
 	remaining, limit := 4999, 5000
