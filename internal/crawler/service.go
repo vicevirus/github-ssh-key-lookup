@@ -148,6 +148,8 @@ func (s *Service) Run(ctx context.Context) error {
 		"scheduler_allocation":    "global=80%,live=10%,owner=10%; unused capacity is borrowed",
 		"owner_refresh_schedule":  durationList(s.Config.OwnerSchedule),
 		"zero_key_retry_ages":     durationList(s.Config.ZeroKeyRecheckAges),
+		"enumeration_workers":     strconv.Itoa(s.Config.Workers),
+		"rest_fallback_workers":   strconv.Itoa(s.Config.RESTFallbackWorkers),
 	} {
 		if err := s.Store.SetState(ctx, key, value); err != nil {
 			return err

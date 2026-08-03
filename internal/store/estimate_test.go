@@ -17,6 +17,7 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 		EnumerationUsersPerRequest: 90,
 		GraphQLUsersPerRequest:     100,
 		RESTRequestsPerFallback:    1,
+		EnumerationRESTShare:       2.0 / 3.0,
 	})
 	if !ok {
 		t.Fatal("phase-aware estimate unavailable")
@@ -37,6 +38,12 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 	}
 	if estimate.EffectiveUsersPerHour < 40_000 || estimate.EffectiveUsersPerHour > 70_000 {
 		t.Fatalf("unexpected sustainable throughput: %#v", estimate)
+	}
+	if estimate.FastScanHoursLow < 80 || estimate.FastScanHoursLow > 110 {
+		t.Fatalf("fast scan should finish in roughly four days: %#v", estimate)
+	}
+	if estimate.FastScanHoursHigh <= estimate.FastScanHoursLow || estimate.FastScanHoursHigh > 130 {
+		t.Fatalf("unexpected conservative fast-scan estimate: %#v", estimate)
 	}
 }
 

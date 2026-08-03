@@ -1446,7 +1446,7 @@ func (s *Store) QueueDepth(ctx context.Context) (int, error) {
 func (s *Store) GlobalBacklog(ctx context.Context, runID int64) (int64, error) {
 	var backlog int64
 	err := s.Pool.QueryRow(ctx, `
-		SELECT GREATEST(0, enumerated_users-processed_users)
+		SELECT GREATEST(0, enumerated_users-attempted_users)
 		FROM crawl_runs WHERE id=$1
 	`, runID).Scan(&backlog)
 	return backlog, err
@@ -4072,6 +4072,8 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	liveTailInitialized, _ := s.State(ctx, "live_tail_initialized")
 	estimatedLow, _ := s.StateInt(ctx, "estimated_accounts_low")
 	estimatedHigh, _ := s.StateInt(ctx, "estimated_accounts_high")
+	enumerationWorkers, _ := s.StateInt(ctx, "enumeration_workers")
+	restFallbackWorkers, _ := s.StateInt(ctx, "rest_fallback_workers")
 	if estimatedLow <= 0 {
 		estimatedLow = 190_000_000
 	}
@@ -4134,8 +4136,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		firstPassStatus["unattempted_discovered_users"] = unattemptedBacklog
 		firstPassStatus["unsettled_users"] = settlementBacklog
 		firstPassStatus["complete"] = active.EnumerationComplete &&
-			active.ProcessedUsers >= active.EnumeratedUsers &&
-			unresolvedRunAnomalies == 0
+			attemptedUsers >= active.EnumeratedUsers
 		firstPassStatus["settled"] = active.EnumerationComplete &&
 			active.ProcessedUsers >= active.EnumeratedUsers &&
 			unresolvedRunAnomalies == 0
@@ -4164,6 +4165,8 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			switch {
 			case active.EnumerationComplete && settlementBacklog == 0:
 				stage = "complete"
+			case !active.EnumerationComplete && restFallbackJobs > 0:
+				stage = "discovery_and_rest_repair"
 			case unattemptedBacklog > 0:
 				stage = "graphql_indexing"
 			case settlementBacklog > 0:
@@ -4219,8 +4222,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				EnumerationUsersPerRequest: enumerationUsersPerRequest,
 				GraphQLUsersPerRequest:     graphqlUsersPerRequest,
 				RESTRequestsPerFallback:    restRequestsPerFallback,
+				EnumerationRESTShare:       float64(enumerationWorkers) / float64(max(int64(1), enumerationWorkers+restFallbackWorkers)),
 			})
 			if phaseOK {
+				fastFinishEarly := now.Add(time.Duration(phased.FastScanHoursLow * float64(time.Hour)))
+				fastFinishLate := now.Add(time.Duration(phased.FastScanHoursHigh * float64(time.Hour)))
 				estimate := map[string]any{
 					"basis":                              phased.Basis,
 					"rate_basis":                         phased.RateBasis,
@@ -4234,6 +4240,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 					"remaining_hours_high":               phased.RemainingHoursHigh,
 					"estimated_finish_early":             now.Add(time.Duration(phased.RemainingHoursLow * float64(time.Hour))),
 					"estimated_finish_late":              now.Add(time.Duration(phased.RemainingHoursHigh * float64(time.Hour))),
+					"fast_scan_remaining_hours_low":      phased.FastScanHoursLow,
+					"fast_scan_remaining_hours_high":     phased.FastScanHoursHigh,
+					"fast_scan_finish_early":             fastFinishEarly,
+					"fast_scan_finish_late":              fastFinishLate,
 					"exact":                              active.EnumerationComplete,
 					"stage":                              stage,
 					"observed_rest_fallback_ratio":       phased.FallbackRatioLow,
@@ -4266,8 +4276,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				firstPassStatus["estimated_remaining_observations_low"] = phased.RemainingAccountsLow
 				firstPassStatus["estimated_remaining_observations_high"] = phased.RemainingAccountsHigh
 				firstPassStatus["attempt_rate_per_hour"] = phased.EffectiveUsersPerHour
-				firstPassStatus["estimated_finish_early"] = estimate["estimated_finish_early"]
-				firstPassStatus["estimated_finish_late"] = estimate["estimated_finish_late"]
+				firstPassStatus["estimated_finish_early"] = fastFinishEarly
+				firstPassStatus["estimated_finish_late"] = fastFinishLate
+				firstPassStatus["settled_finish_early"] = estimate["estimated_finish_early"]
+				firstPassStatus["settled_finish_late"] = estimate["estimated_finish_late"]
 				firstPassStatus["estimate_basis"] = phased.Basis
 			} else if etaRate > 0 {
 				lowTotal, highTotal := estimatedLow, estimatedHigh

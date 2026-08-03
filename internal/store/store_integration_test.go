@@ -83,6 +83,29 @@ func TestRepeatedMigrationDoesNotLockLiveQueueTables(t *testing.T) {
 	}
 }
 
+func TestGlobalBackpressureCountsOnlyUnattemptedAccounts(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	var runID int64
+	if err := database.Pool.QueryRow(ctx, `
+		INSERT INTO crawl_runs (
+		  kind, next_since_id, next_url, enumerated_users,
+		  attempted_users, processed_users
+		) VALUES ('initial', 1000, 'https://api.github.com/users?since=1000',
+		          1000, 900, 100)
+		RETURNING id
+	`).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	backlog, err := database.GlobalBacklog(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog != 100 {
+		t.Fatalf("producer backpressure=%d, want 100 unattempted accounts", backlog)
+	}
+}
+
 func TestZeroKeyUserIsDiscardedThenDiscoveredOnLaterPass(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()

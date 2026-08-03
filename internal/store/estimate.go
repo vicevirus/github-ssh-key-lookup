@@ -19,6 +19,7 @@ type phaseEstimateInput struct {
 	EnumerationUsersPerRequest float64
 	GraphQLUsersPerRequest     float64
 	RESTRequestsPerFallback    float64
+	EnumerationRESTShare       float64
 }
 
 type phaseEstimate struct {
@@ -32,6 +33,8 @@ type phaseEstimate struct {
 	RemainingAccountsHigh      int64
 	RemainingHoursLow          float64
 	RemainingHoursHigh         float64
+	FastScanHoursLow           float64
+	FastScanHoursHigh          float64
 	EffectiveUsersPerHour      float64
 	FallbackRatioLow           float64
 	FallbackRatioHigh          float64
@@ -63,6 +66,7 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	restRequestsPerFallback := boundedRate(
 		input.RESTRequestsPerFallback, 1, 10, 1,
 	)
+	enumerationRESTShare := boundedRate(input.EnumerationRESTShare, 0.05, 1, 0.5)
 
 	settlementBacklog := max(int64(0), input.EnumeratedUsers-input.ProcessedUsers)
 	nonRESTBacklog := max(int64(0), settlementBacklog-input.RESTFallbackUsers)
@@ -108,6 +112,10 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 
 	currentRESTRequests := float64(input.RESTFallbackUsers) * restRequestsPerFallback
 	currentGraphQLPoints := float64(nonRESTBacklog) / graphqlUsersPerRequest
+	fastScanRESTHoursLow := (float64(futureLow) / enumerationUsersPerRequest) /
+		(input.RESTPerHour * enumerationRESTShare)
+	fastScanGraphQLHoursLow := (currentGraphQLPoints +
+		float64(futureLow)/graphqlUsersPerRequest) / input.GraphQLPerHour
 
 	restRequestsLow := currentRESTRequests +
 		float64(futureLow)/enumerationUsersPerRequest +
@@ -118,6 +126,10 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	// pacers already reserve primary quota; this margin is for retries, key-page
 	// pagination, tail traffic, and API variance.
 	const highOverhead = 1.10
+	fastScanRESTHoursHigh := (float64(futureHigh) / enumerationUsersPerRequest) *
+		highOverhead / (input.RESTPerHour * enumerationRESTShare)
+	fastScanGraphQLHoursHigh := (currentGraphQLPoints +
+		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead / input.GraphQLPerHour
 	restRequestsHigh := (currentRESTRequests +
 		float64(futureHigh)/enumerationUsersPerRequest +
 		float64(futureHigh)*fallbackRatioHigh*restRequestsPerFallback) * highOverhead
@@ -130,6 +142,8 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	graphqlHoursHigh := graphqlPointsHigh / input.GraphQLPerHour
 	remainingHoursLow := math.Max(restHoursLow, graphqlHoursLow)
 	remainingHoursHigh := math.Max(restHoursHigh, graphqlHoursHigh)
+	fastScanHoursLow := math.Max(fastScanRESTHoursLow, fastScanGraphQLHoursLow)
+	fastScanHoursHigh := math.Max(fastScanRESTHoursHigh, fastScanGraphQLHoursHigh)
 	remainingAccountsLow := settlementBacklog + futureLow
 	remainingAccountsHigh := settlementBacklog + futureHigh
 	effectiveUsersPerHour := 0.0
@@ -148,6 +162,8 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		RemainingAccountsHigh:      remainingAccountsHigh,
 		RemainingHoursLow:          remainingHoursLow,
 		RemainingHoursHigh:         remainingHoursHigh,
+		FastScanHoursLow:           fastScanHoursLow,
+		FastScanHoursHigh:          fastScanHoursHigh,
 		EffectiveUsersPerHour:      effectiveUsersPerHour,
 		FallbackRatioLow:           fallbackRatioLow,
 		FallbackRatioHigh:          fallbackRatioHigh,

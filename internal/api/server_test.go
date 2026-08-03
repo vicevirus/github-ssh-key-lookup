@@ -31,6 +31,8 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 				"estimated_finish_late":  finish.Add(time.Hour),
 				"basis":                  "active shard ranges and observed user density",
 				"rate_is_preliminary":    true,
+				"fast_scan_finish_early": finish.Add(-20 * time.Hour),
+				"fast_scan_finish_late":  finish.Add(-18 * time.Hour),
 			},
 		},
 		"crawler": map[string]any{
@@ -76,8 +78,9 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	if progress["queued_users"] != int64(300) || progress["estimate_basis"] == nil {
 		t.Fatalf("missing compact progress: %#v", progress)
 	}
-	if progress["estimate_scope"] != "first pass: discovery plus settled GraphQL/REST key coverage" {
-		t.Fatalf("missing honest estimate scope: %#v", progress)
+	if progress["fast_scan_finish_early"] == nil || progress["settled_finish_early"] == nil ||
+		progress["fast_scan_scope"] == nil || progress["settled_scope"] == nil {
+		t.Fatalf("missing distinct fast-scan and settled estimates: %#v", progress)
 	}
 	if progress["attempted_users"] != int64(750) || progress["attempt_rate_per_hour"] != 390.0 {
 		t.Fatalf("missing first-attempt progress: %#v", progress)
