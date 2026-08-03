@@ -30,6 +30,30 @@ func TestNormalizeUsersPreservesNullNode(t *testing.T) {
 	}
 }
 
+func TestNormalizeResourceUsersAcceptsMigratedNodeIDButChecksDatabaseID(t *testing.T) {
+	jobs := []model.Candidate{{GitHubID: 1, NodeID: "legacy", Login: "old-login"}}
+	nodes := []*githubapi.GraphQLUser{{
+		TypeName: "User", ID: "U_new", DatabaseID: 1, Login: "new-login",
+		CreatedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		PublicKeys: githubapi.KeyConnection{
+			TotalCount: 0,
+			PageInfo:   githubapi.PageInfo{HasNextPage: false},
+		},
+	}}
+	results, resultErrors, err := normalizeResourceUsers(jobs, nodes)
+	if err != nil || resultErrors[0] != nil || results[0] == nil ||
+		results[0].NodeID != "U_new" || results[0].Login != "new-login" {
+		t.Fatalf("current URL identity was not accepted: results=%#v errors=%#v err=%v",
+			results, resultErrors, err)
+	}
+	nodes[0].DatabaseID = 2
+	results, resultErrors, err = normalizeResourceUsers(jobs, nodes)
+	if err != nil || results[0] != nil || resultErrors[0] == nil {
+		t.Fatalf("resource identity mismatch was accepted: results=%#v errors=%#v err=%v",
+			results, resultErrors, err)
+	}
+}
+
 func TestRetryDelayGrowsAndCaps(t *testing.T) {
 	if delay := retryDelay(errors.New("temporary"), 1); delay < 5*time.Second || delay > 10*time.Second {
 		t.Fatalf("unexpected first delay: %s", delay)

@@ -20,6 +20,10 @@ type phaseEstimateInput struct {
 	GraphQLUsersPerRequest     float64
 	RESTRequestsPerFallback    float64
 	EnumerationRESTShare       float64
+	PrimaryGraphQLShare        float64
+	ResourceUsersPerRequest    float64
+	ResourceRESTFailureLow     float64
+	ResourceRESTFailureHigh    float64
 }
 
 type phaseEstimate struct {
@@ -49,6 +53,9 @@ type phaseEstimate struct {
 	EnumerationUsersPerRequest float64
 	GraphQLUsersPerRequest     float64
 	RESTRequestsPerFallback    float64
+	ResourceUsersPerRequest    float64
+	ResourceRESTFailureLow     float64
+	ResourceRESTFailureHigh    float64
 	Preliminary                bool
 }
 
@@ -67,6 +74,12 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		input.RESTRequestsPerFallback, 1, 10, 1,
 	)
 	enumerationRESTShare := boundedRate(input.EnumerationRESTShare, 0.05, 1, 0.5)
+	primaryGraphQLShare := boundedRate(input.PrimaryGraphQLShare, 0.05, 1, 0.8)
+	resourceUsersPerRequest := boundedRate(input.ResourceUsersPerRequest, 1, 100, 100)
+	resourceRESTFailureLow := clamp(input.ResourceRESTFailureLow, 0, 1)
+	resourceRESTFailureHigh := clamp(
+		math.Max(input.ResourceRESTFailureHigh, resourceRESTFailureLow), 0, 1,
+	)
 
 	settlementBacklog := max(int64(0), input.EnumeratedUsers-input.ProcessedUsers)
 	nonRESTBacklog := max(int64(0), settlementBacklog-input.RESTFallbackUsers)
@@ -92,10 +105,10 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		}
 	}
 
-	// Every account already proven inaccessible consumed an identity-safe REST
-	// lookup. Accounts still in the fallback lane will consume at least one.
-	// Together they provide a durable, phase-independent lower-bound sample of
-	// how often future GraphQL observations will need REST verification.
+	// Historical null-node observations provide a durable estimate of how many
+	// future accounts need the URL-resource resolver. Those repairs are batched
+	// in GraphQL; only the small URL-null or identity-mismatch remainder uses
+	// an individual REST verification.
 	fallbackSample := input.InaccessibleUsers + input.RESTFallbackUsers
 	fallbackRatioLow := 0.10
 	if input.AttemptedUsers > 0 {
@@ -103,24 +116,31 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 			float64(fallbackSample)/float64(input.AttemptedUsers), 0.001, 1,
 		)
 	}
-	// The upper estimate covers accessible fallbacks, retry traffic, and drift
-	// in the remaining ranges without pretending that every account uses REST.
+	// The upper estimate covers retries and drift in the remaining ranges.
 	fallbackRatioHigh := clamp(
 		math.Max(fallbackRatioLow*1.20, fallbackRatioLow+0.02),
 		fallbackRatioLow, 1,
 	)
 
-	currentRESTRequests := float64(input.RESTFallbackUsers) * restRequestsPerFallback
-	currentGraphQLPoints := float64(nonRESTBacklog) / graphqlUsersPerRequest
+	currentResourceUsers := float64(input.RESTFallbackUsers)
+	currentRESTRequestsLow := currentResourceUsers * resourceRESTFailureLow * restRequestsPerFallback
+	currentRESTRequestsHigh := currentResourceUsers * resourceRESTFailureHigh * restRequestsPerFallback
+	currentPrimaryGraphQLPoints := float64(nonRESTBacklog) / graphqlUsersPerRequest
+	currentGraphQLPoints := currentPrimaryGraphQLPoints +
+		currentResourceUsers/resourceUsersPerRequest
 	fastScanRESTHoursLow := (float64(futureLow) / enumerationUsersPerRequest) /
 		(input.RESTPerHour * enumerationRESTShare)
-	fastScanGraphQLHoursLow := (currentGraphQLPoints +
-		float64(futureLow)/graphqlUsersPerRequest) / input.GraphQLPerHour
+	fastScanGraphQLHoursLow := (currentPrimaryGraphQLPoints +
+		float64(futureLow)/graphqlUsersPerRequest) /
+		(input.GraphQLPerHour * primaryGraphQLShare)
 
-	restRequestsLow := currentRESTRequests +
+	futureResourceUsersLow := float64(futureLow) * fallbackRatioLow
+	futureResourceUsersHigh := float64(futureHigh) * fallbackRatioHigh
+	restRequestsLow := currentRESTRequestsLow +
 		float64(futureLow)/enumerationUsersPerRequest +
-		float64(futureLow)*fallbackRatioLow*restRequestsPerFallback
-	graphqlPointsLow := currentGraphQLPoints + float64(futureLow)/graphqlUsersPerRequest
+		futureResourceUsersLow*resourceRESTFailureLow*restRequestsPerFallback
+	graphqlPointsLow := currentGraphQLPoints + float64(futureLow)/graphqlUsersPerRequest +
+		futureResourceUsersLow/resourceUsersPerRequest
 
 	// Ten percent operational overhead is kept on the late side only. The live
 	// pacers already reserve primary quota; this margin is for retries, key-page
@@ -128,13 +148,15 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	const highOverhead = 1.10
 	fastScanRESTHoursHigh := (float64(futureHigh) / enumerationUsersPerRequest) *
 		highOverhead / (input.RESTPerHour * enumerationRESTShare)
-	fastScanGraphQLHoursHigh := (currentGraphQLPoints +
-		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead / input.GraphQLPerHour
-	restRequestsHigh := (currentRESTRequests +
+	fastScanGraphQLHoursHigh := (currentPrimaryGraphQLPoints +
+		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead /
+		(input.GraphQLPerHour * primaryGraphQLShare)
+	restRequestsHigh := (currentRESTRequestsHigh +
 		float64(futureHigh)/enumerationUsersPerRequest +
-		float64(futureHigh)*fallbackRatioHigh*restRequestsPerFallback) * highOverhead
+		futureResourceUsersHigh*resourceRESTFailureHigh*restRequestsPerFallback) * highOverhead
 	graphqlPointsHigh := (currentGraphQLPoints +
-		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead
+		float64(futureHigh)/graphqlUsersPerRequest +
+		futureResourceUsersHigh/resourceUsersPerRequest) * highOverhead
 
 	restHoursLow := restRequestsLow / input.RESTPerHour
 	restHoursHigh := restRequestsHigh / input.RESTPerHour
@@ -153,7 +175,7 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 
 	return phaseEstimate{
 		Basis:                      basis,
-		RateBasis:                  "phase-aware REST enumeration/fallback and GraphQL batch capacities",
+		RateBasis:                  "phase-aware REST enumeration and GraphQL observation/resource-repair capacities",
 		EstimatedTotalLow:          input.EnumeratedUsers + futureLow,
 		EstimatedTotalHigh:         input.EnumeratedUsers + futureHigh,
 		EstimatedFutureUsersLow:    futureLow,
@@ -178,6 +200,9 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		EnumerationUsersPerRequest: enumerationUsersPerRequest,
 		GraphQLUsersPerRequest:     graphqlUsersPerRequest,
 		RESTRequestsPerFallback:    restRequestsPerFallback,
+		ResourceUsersPerRequest:    resourceUsersPerRequest,
+		ResourceRESTFailureLow:     resourceRESTFailureLow,
+		ResourceRESTFailureHigh:    resourceRESTFailureHigh,
 		Preliminary:                preliminary,
 	}, true
 }

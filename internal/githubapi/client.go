@@ -55,6 +55,20 @@ query MoreKeys($id: ID!, $after: String!) {
   rateLimit { cost limit remaining used resetAt }
 }`
 
+const resourceUserFields = `
+    __typename
+    ... on User {
+      id
+      databaseId
+      login
+      createdAt
+      publicKeys(first: 100) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { key fingerprint }
+      }
+    }`
+
 type Client struct {
 	Token      string
 	RESTBase   string
@@ -491,6 +505,85 @@ func (c *Client) FetchUsers(ctx context.Context, ids []string) (UsersAndKeys, er
 	}, nil
 }
 
+// FetchUsersByResources resolves profile URLs through GitHub's documented
+// UniformResourceLocatable query. This is deliberately separate from
+// FetchUsers: GitHub can resolve a public profile URL even when both node(id:)
+// and user(login:) return null. Results retain input order and callers must
+// verify the immutable databaseId before accepting a snapshot.
+func (c *Client) FetchUsersByResources(
+	ctx context.Context, logins []string,
+) (UsersAndKeys, error) {
+	if len(logins) == 0 {
+		return UsersAndKeys{}, errors.New("GraphQL resource batch is empty")
+	}
+	if len(logins) > 100 {
+		return UsersAndKeys{}, fmt.Errorf(
+			"GraphQL resource batch exceeds verified GitHub limit: %d > 100", len(logins),
+		)
+	}
+	query, variables := resourceUsersQuery(logins)
+	var envelope struct {
+		Data   map[string]json.RawMessage `json:"data"`
+		Errors []graphQLError             `json:"errors"`
+	}
+	elapsed, err := c.graphqlNextGlobalID(ctx, query, variables, &envelope)
+	if err != nil {
+		return UsersAndKeys{}, err
+	}
+	var rate graphQLRate
+	if raw, exists := envelope.Data["rateLimit"]; exists {
+		if err := json.Unmarshal(raw, &rate); err != nil {
+			return UsersAndKeys{}, fmt.Errorf("decode GitHub GraphQL resource rate: %w", err)
+		}
+	}
+	if limited := graphQLRateError(envelope.Errors, rate); limited != nil {
+		return UsersAndKeys{}, limited
+	}
+	if len(envelope.Errors) != 0 && !onlyNotFound(envelope.Errors) {
+		return UsersAndKeys{}, fmt.Errorf("GitHub GraphQL resource errors: %v", envelope.Errors)
+	}
+	nodes := make([]*GraphQLUser, len(logins))
+	for index := range logins {
+		alias := fmt.Sprintf("resource%d", index)
+		raw, exists := envelope.Data[alias]
+		if !exists {
+			return UsersAndKeys{}, fmt.Errorf("GitHub GraphQL resource response omitted %s", alias)
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		var user GraphQLUser
+		if err := json.Unmarshal(raw, &user); err != nil {
+			return UsersAndKeys{}, fmt.Errorf("decode GitHub GraphQL %s: %w", alias, err)
+		}
+		nodes[index] = &user
+	}
+	return UsersAndKeys{Nodes: nodes, Rate: rate.model(), Elapsed: elapsed}, nil
+}
+
+func resourceUsersQuery(logins []string) (string, map[string]any) {
+	var query strings.Builder
+	query.WriteString("query ResourceUsers(")
+	variables := make(map[string]any, len(logins))
+	for index, login := range logins {
+		if index > 0 {
+			query.WriteString(", ")
+		}
+		name := fmt.Sprintf("url%d", index)
+		fmt.Fprintf(&query, "$%s: URI!", name)
+		variables[name] = "https://github.com/" + url.PathEscape(login)
+	}
+	query.WriteString(") {\n")
+	for index := range logins {
+		fmt.Fprintf(
+			&query, "  resource%d: resource(url: $url%d) {%s\n  }\n",
+			index, index, resourceUserFields,
+		)
+	}
+	query.WriteString("  rateLimit { cost limit remaining used resetAt }\n}")
+	return query.String(), variables
+}
+
 func onlyNotFound(errors []graphQLError) bool {
 	if len(errors) == 0 {
 		return false
@@ -528,6 +621,22 @@ func (c *Client) MoreKeys(ctx context.Context, nodeID, cursor string) (*GraphQLU
 }
 
 func (c *Client) graphql(ctx context.Context, query string, variables map[string]any, target any) (time.Duration, error) {
+	return c.graphqlRequest(ctx, query, variables, target, false)
+}
+
+func (c *Client) graphqlNextGlobalID(
+	ctx context.Context, query string, variables map[string]any, target any,
+) (time.Duration, error) {
+	return c.graphqlRequest(ctx, query, variables, target, true)
+}
+
+func (c *Client) graphqlRequest(
+	ctx context.Context,
+	query string,
+	variables map[string]any,
+	target any,
+	nextGlobalID bool,
+) (time.Duration, error) {
 	payload, err := json.Marshal(map[string]any{"query": query, "variables": variables})
 	if err != nil {
 		return 0, err
@@ -538,6 +647,9 @@ func (c *Client) graphql(ctx context.Context, query string, variables map[string
 	}
 	c.headers(req)
 	req.Header.Set("Content-Type", "application/json")
+	if nextGlobalID {
+		req.Header.Set("X-Github-Next-Global-ID", "1")
+	}
 	started := time.Now()
 	resp, err := c.do(req)
 	if err != nil {

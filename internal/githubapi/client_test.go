@@ -106,6 +106,58 @@ func TestFetchUsersEnforcesVerifiedHundredIDLimitAndCost(t *testing.T) {
 	}
 }
 
+func TestFetchUsersByResourcesBatchesAliasesAndRequestsCurrentNodeIDs(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Header.Get("X-Github-Next-Global-ID") != "1" {
+			t.Fatal("resource repair did not request current global node IDs")
+		}
+		var body struct {
+			Query     string            `json:"query"`
+			Variables map[string]string `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(body.Query, "resource0: resource(url: $url0)") ||
+			!strings.Contains(body.Query, "resource1: resource(url: $url1)") ||
+			body.Variables["url0"] != "https://github.com/old-login" ||
+			body.Variables["url1"] != "https://github.com/second" {
+			t.Fatalf("unexpected resource query: %#v", body)
+		}
+		_, _ = response.Write([]byte(`{
+          "data": {
+            "resource0": {"__typename":"User","id":"U_new_1","databaseId":1,"login":"new-login","createdAt":"2020-01-01T00:00:00Z","publicKeys":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}},
+            "resource1": null,
+            "rateLimit":{"cost":1,"limit":5000,"remaining":4999,"used":1,"resetAt":"2026-08-03T08:00:00Z"}
+          }
+        }`))
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.GraphQLURL = server.URL
+	client.HTTP = server.Client()
+	result, err := client.FetchUsersByResources(
+		context.Background(), []string{"old-login", "second"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Nodes) != 2 || result.Nodes[0] == nil ||
+		result.Nodes[0].DatabaseID != 1 || result.Nodes[0].ID != "U_new_1" ||
+		result.Nodes[1] != nil || result.Rate.Cost != 1 {
+		t.Fatalf("unexpected resource result: %#v", result)
+	}
+	tooMany := make([]string, 101)
+	if _, err := client.FetchUsersByResources(context.Background(), tooMany); err == nil {
+		t.Fatal("accepted more than 100 URL resources")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("invalid resource batch reached server: calls=%d", calls.Load())
+	}
+}
+
 func TestFetchUsersAcceptsNotFoundAsInaccessibleNode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		_, _ = response.Write([]byte(`{"data":{"nodes":[null],"rateLimit":{"cost":1,"limit":5000,"remaining":4999,"used":1,"resetAt":"2026-07-30T08:00:00Z"}},"errors":[{"type":"NOT_FOUND","message":"gone"}]}`))

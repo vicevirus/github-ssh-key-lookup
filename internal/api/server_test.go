@@ -16,7 +16,7 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	snapshot := map[string]any{
 		"index": map[string]int64{"owners": 12, "keys": 34, "associations": 56},
 		"progress": map[string]any{
-			"phase": "initial_scan", "stage": "rest_fallback_drain",
+			"phase": "initial_scan", "stage": "resource_repair_drain",
 			"enumerated_users": int64(1000),
 			"attempted_users":  int64(750), "processed_users": int64(700),
 			"processing_backlog":           int64(300),
@@ -71,7 +71,7 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 		t.Fatalf("unexpected status: %#v", result)
 	}
 	crawler := result["crawler"].(map[string]any)
-	if crawler["stage"] != "rest_fallback_drain" {
+	if crawler["stage"] != "resource_repair_drain" {
 		t.Fatalf("missing phase-aware crawler stage: %#v", crawler)
 	}
 	progress := result["progress"].(map[string]any)
@@ -87,6 +87,9 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	}
 	if progress["rest_fallback_users"] != int64(25) {
 		t.Fatalf("missing REST fallback backlog: %#v", progress)
+	}
+	if progress["resource_repair_users"] != int64(25) {
+		t.Fatalf("missing URL-resource repair backlog: %#v", progress)
 	}
 	if progress["estimate_preliminary"] != true {
 		t.Fatalf("missing estimate warm-up state: %#v", progress)

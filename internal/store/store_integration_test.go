@@ -448,6 +448,45 @@ func TestRESTFallbackClaimsAreDurableAndExcludedFromGraphQL(t *testing.T) {
 	}
 }
 
+func TestRESTFallbackBatchClaimsAreBoundedAndRestartSafe(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	candidates := make([]model.Candidate, 150)
+	for index := range candidates {
+		candidates[index] = model.Candidate{
+			GitHubID: int64(10_000 + index),
+			NodeID:   "U_" + strconv.Itoa(10_000+index),
+			Login:    "repair-" + strconv.Itoa(index),
+		}
+	}
+	if _, err := database.Enqueue(ctx, "reconcile", candidates); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.ClaimScheduledAccounts(ctx, 150, "global")
+	if err != nil || len(jobs) != 150 {
+		t.Fatalf("initial claims=%d err=%v", len(jobs), err)
+	}
+	if err := database.MoveAccountsToRESTFallback(ctx, jobs, errors.New("null nodes")); err != nil {
+		t.Fatal(err)
+	}
+	first, err := database.ClaimRESTFallbackBatch(ctx, 100)
+	if err != nil || len(first) != 100 {
+		t.Fatalf("first repair batch=%d err=%v", len(first), err)
+	}
+	second, err := database.ClaimRESTFallbackBatch(ctx, 100)
+	if err != nil || len(second) != 50 {
+		t.Fatalf("second repair batch=%d err=%v", len(second), err)
+	}
+	if err := database.RequeueRESTFallbackBatchAfter(
+		ctx, first, errors.New("temporary GraphQL error"), time.Hour,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ClaimRESTFallbackBatch(ctx, 100); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("future repair batch was claimed early: %v", err)
+	}
+}
+
 func TestMainRunCannotCompleteWithAnUnresolvedAnomaly(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()

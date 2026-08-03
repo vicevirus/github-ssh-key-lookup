@@ -610,14 +610,14 @@ func splitFailedGraphQLBatch(
 }
 
 func (s *Service) restFallbackWorker(ctx context.Context, workerID int) error {
-	worker := fmt.Sprintf("rest-fallback-%d", workerID)
-	role := "identity-safe REST key fallback"
-	s.workerActivity(ctx, worker, role, "starting", "waiting for GraphQL-null accounts")
+	worker := fmt.Sprintf("resource-repair-%d", workerID)
+	role := "GraphQL URL-resource repair with REST fallback"
+	s.workerActivity(ctx, worker, role, "starting", "waiting for GraphQL-null account batch")
 	defer s.Store.StopWorker(context.Background(), worker, role)
 	for ctx.Err() == nil {
-		job, err := s.Store.ClaimRESTFallback(ctx)
+		jobs, err := s.Store.ClaimRESTFallbackBatch(ctx, 100)
 		if errors.Is(err, pgx.ErrNoRows) {
-			s.workerActivity(ctx, worker, role, "waiting", "REST fallback queue is current")
+			s.workerActivity(ctx, worker, role, "waiting", "URL-resource repair queue is current")
 			if err := sleep(ctx, 500*time.Millisecond); err != nil {
 				return nil
 			}
@@ -626,7 +626,98 @@ func (s *Service) restFallbackWorker(ctx context.Context, workerID int) error {
 		if err != nil {
 			return err
 		}
-		if err := s.processRESTFallback(ctx, worker, role, *job); err != nil {
+		if err := s.processResourceRepairBatch(ctx, worker, role, jobs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) processResourceRepairBatch(
+	ctx context.Context,
+	worker string,
+	role string,
+	jobs []model.Candidate,
+) error {
+	logins := make([]string, len(jobs))
+	for index := range jobs {
+		logins[index] = jobs[index].Login
+	}
+	if err := s.graphql.Wait(ctx); err != nil {
+		_ = s.Store.RequeueRESTFallbackBatchAfter(
+			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
+		)
+		return nil
+	}
+	response, err := s.GitHub.FetchUsersByResources(ctx, logins)
+	if err != nil {
+		s.workerError(ctx, worker, role, "GraphQL URL-resource batch failed", err)
+		s.handleRateError(ctx, err, s.graphql, "graphql")
+		if retryErr := s.Store.RequeueRESTFallbackBatchAfter(
+			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
+		); retryErr != nil {
+			return retryErr
+		}
+		if isAuthenticationError(err) {
+			return err
+		}
+		return nil
+	}
+	s.graphql.Observe(response.Rate)
+	s.graphql.ExtraCost(response.Rate.Cost)
+	results, resultErrors, err := normalizeResourceUsers(jobs, response.Nodes)
+	if err != nil {
+		if retryErr := s.Store.RequeueRESTFallbackBatchAfter(
+			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
+		); retryErr != nil {
+			return retryErr
+		}
+		return nil
+	}
+	validJobs := make([]model.Candidate, 0, len(jobs))
+	validResults := make([]*model.UserResult, 0, len(jobs))
+	unresolved := make([]model.Candidate, 0)
+	keyCount := 0
+	for index, result := range results {
+		if resultErrors[index] != nil {
+			s.Logger.Warn("invalid GraphQL URL-resource key response",
+				"github_id", jobs[index].GitHubID, "error", resultErrors[index])
+			unresolved = append(unresolved, jobs[index])
+			continue
+		}
+		if result == nil {
+			unresolved = append(unresolved, jobs[index])
+			continue
+		}
+		job := jobs[index]
+		job.NodeID, job.Login = result.NodeID, result.Login
+		validJobs = append(validJobs, job)
+		validResults = append(validResults, result)
+		keyCount += len(result.Keys)
+	}
+	if err := s.Store.CompleteAccountsScheduled(
+		ctx, validJobs, validResults,
+		s.Config.OwnerSchedule, s.Config.ZeroKeyRecheckAges,
+	); err != nil {
+		if retryErr := s.Store.RequeueRESTFallbackBatchAfter(
+			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
+		); retryErr != nil {
+			return fmt.Errorf("commit URL-resource repair batch: %w (retry: %v)", err, retryErr)
+		}
+		return nil
+	}
+	s.workerRequest(
+		ctx, worker, role, "indexed GraphQL URL-resource repair batch",
+		response.Rate, len(validJobs), keyCount,
+	)
+	for index, job := range unresolved {
+		if err := s.processRESTFallback(ctx, worker, role, job); err != nil {
+			if index+1 < len(unresolved) {
+				_ = s.Store.RequeueRESTFallbackBatchAfter(
+					context.Background(), unresolved[index+1:], err,
+					retryDelay(err, maxFallbackAttempts(unresolved[index+1:])),
+				)
+			}
 			return err
 		}
 	}
@@ -927,6 +1018,20 @@ func (s *Service) processOverflowREST(
 func normalizeUsers(
 	jobs []model.Candidate, nodes []*githubapi.GraphQLUser,
 ) ([]*model.UserResult, []error, error) {
+	return normalizeGraphQLUsers(jobs, nodes, true)
+}
+
+func normalizeResourceUsers(
+	jobs []model.Candidate, nodes []*githubapi.GraphQLUser,
+) ([]*model.UserResult, []error, error) {
+	return normalizeGraphQLUsers(jobs, nodes, false)
+}
+
+func normalizeGraphQLUsers(
+	jobs []model.Candidate,
+	nodes []*githubapi.GraphQLUser,
+	requireNodeID bool,
+) ([]*model.UserResult, []error, error) {
 	if len(jobs) != len(nodes) {
 		return nil, nil, errors.New("GraphQL response cardinality mismatch")
 	}
@@ -936,7 +1041,8 @@ func normalizeUsers(
 		if user == nil || user.TypeName != "User" {
 			continue
 		}
-		if user.ID != jobs[index].NodeID || user.DatabaseID != jobs[index].GitHubID {
+		if user.DatabaseID != jobs[index].GitHubID ||
+			(requireNodeID && user.ID != jobs[index].NodeID) {
 			resultErrors[index] = fmt.Errorf(
 				"GraphQL identity mismatch: expected %s/%d, received %s/%d",
 				jobs[index].NodeID, jobs[index].GitHubID, user.ID, user.DatabaseID,
@@ -972,6 +1078,14 @@ func normalizeUsers(
 		}
 	}
 	return results, resultErrors, nil
+}
+
+func maxFallbackAttempts(jobs []model.Candidate) int {
+	attempts := 1
+	for _, job := range jobs {
+		attempts = max(attempts, job.FallbackAttempts)
+	}
+	return attempts
 }
 
 func normalizeKeys(keys []githubapi.GraphQLKey) ([]model.PublicKey, error) {

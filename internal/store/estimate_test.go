@@ -17,7 +17,10 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 		EnumerationUsersPerRequest: 90,
 		GraphQLUsersPerRequest:     100,
 		RESTRequestsPerFallback:    1,
-		EnumerationRESTShare:       2.0 / 3.0,
+		EnumerationRESTShare:       0.95,
+		PrimaryGraphQLShare:        0.8,
+		ResourceUsersPerRequest:    100,
+		ResourceRESTFailureHigh:    0.01,
 	})
 	if !ok {
 		t.Fatal("phase-aware estimate unavailable")
@@ -26,28 +29,28 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 		estimate.EstimatedFutureUsersLow > 52_200_000 {
 		t.Fatalf("unexpected future-user estimate: %#v", estimate)
 	}
-	if estimate.RemainingHoursLow < 900 || estimate.RemainingHoursLow > 1_200 {
-		t.Fatalf("early estimate should be measured in weeks, not 2027: %#v", estimate)
+	if estimate.RemainingHoursLow < 60 || estimate.RemainingHoursLow > 75 {
+		t.Fatalf("URL-resource repair should settle near the fast scan: %#v", estimate)
 	}
 	if estimate.RemainingHoursHigh <= estimate.RemainingHoursLow ||
-		estimate.RemainingHoursHigh > 1_600 {
+		estimate.RemainingHoursHigh > 105 {
 		t.Fatalf("unexpected late estimate: %#v", estimate)
 	}
-	if estimate.RESTHoursLow <= estimate.GraphQLHoursLow {
-		t.Fatalf("REST should be the measured bottleneck: %#v", estimate)
+	if estimate.GraphQLHoursLow <= estimate.RESTHoursLow {
+		t.Fatalf("batched GraphQL observation/repair should be the measured bottleneck: %#v", estimate)
 	}
-	if estimate.EffectiveUsersPerHour < 40_000 || estimate.EffectiveUsersPerHour > 70_000 {
+	if estimate.EffectiveUsersPerHour < 700_000 || estimate.EffectiveUsersPerHour > 900_000 {
 		t.Fatalf("unexpected sustainable throughput: %#v", estimate)
 	}
-	if estimate.FastScanHoursLow < 80 || estimate.FastScanHoursLow > 110 {
-		t.Fatalf("fast scan should finish in roughly four days: %#v", estimate)
+	if estimate.FastScanHoursLow < 65 || estimate.FastScanHoursLow > 75 {
+		t.Fatalf("fast scan should finish in roughly three days: %#v", estimate)
 	}
-	if estimate.FastScanHoursHigh <= estimate.FastScanHoursLow || estimate.FastScanHoursHigh > 130 {
+	if estimate.FastScanHoursHigh <= estimate.FastScanHoursLow || estimate.FastScanHoursHigh > 95 {
 		t.Fatalf("unexpected conservative fast-scan estimate: %#v", estimate)
 	}
 }
 
-func TestEstimatePhasedCompletionUsesExactFallbackDrainAfterEnumeration(t *testing.T) {
+func TestEstimatePhasedCompletionUsesBatchedResourceRepairAfterEnumeration(t *testing.T) {
 	estimate, ok := estimatePhasedCompletion(phaseEstimateInput{
 		EnumerationComplete:        true,
 		EnumeratedUsers:            1_000,
@@ -59,6 +62,8 @@ func TestEstimatePhasedCompletionUsesExactFallbackDrainAfterEnumeration(t *testi
 		EnumerationUsersPerRequest: 90,
 		GraphQLUsersPerRequest:     100,
 		RESTRequestsPerFallback:    1,
+		ResourceUsersPerRequest:    100,
+		ResourceRESTFailureHigh:    0.01,
 	})
 	if !ok {
 		t.Fatal("phase-aware estimate unavailable")
@@ -66,8 +71,8 @@ func TestEstimatePhasedCompletionUsesExactFallbackDrainAfterEnumeration(t *testi
 	if estimate.EstimatedFutureUsersLow != 0 || estimate.EstimatedTotalLow != 1_000 {
 		t.Fatalf("completed enumeration must use an exact population: %#v", estimate)
 	}
-	if estimate.RemainingHoursLow != 8 {
-		t.Fatalf("remaining REST drain=%v hours, want 8", estimate.RemainingHoursLow)
+	if estimate.RemainingHoursLow != 0.08 {
+		t.Fatalf("remaining GraphQL resource drain=%v hours, want 0.08", estimate.RemainingHoursLow)
 	}
 }
 

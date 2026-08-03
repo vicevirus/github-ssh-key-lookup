@@ -2396,9 +2396,10 @@ func (s *Store) RequeueAccountsAfter(
 	return nil
 }
 
-// MoveAccountsToRESTFallback removes accounts from the GraphQL lane without
-// settling them. The REST lane resolves the immutable numeric ID, follows the
-// complete public-key pagination chain, and only then commits coverage.
+// MoveAccountsToRESTFallback removes accounts from the primary node-ID lane
+// without settling them. Repair first batches profile URLs through GraphQL's
+// resource resolver and uses REST only when that identity-safe route remains
+// null, mismatched, or invalid.
 func (s *Store) MoveAccountsToRESTFallback(
 	ctx context.Context, jobs []model.Candidate, cause error,
 ) error {
@@ -2431,14 +2432,26 @@ func (s *Store) MoveAccountsToRESTFallback(
 }
 
 func (s *Store) ClaimRESTFallback(ctx context.Context) (*model.Candidate, error) {
-	var job model.Candidate
-	err := s.Pool.QueryRow(ctx, `
+	jobs, err := s.ClaimRESTFallbackBatch(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	return &jobs[0], nil
+}
+
+func (s *Store) ClaimRESTFallbackBatch(
+	ctx context.Context, limit int,
+) ([]model.Candidate, error) {
+	if limit < 1 || limit > 100 {
+		return nil, fmt.Errorf("REST fallback claim limit must be between 1 and 100: %d", limit)
+	}
+	rows, err := s.Pool.Query(ctx, `
 		WITH picked AS (
 		  SELECT id FROM account_queue
 		  WHERE status='rest_fallback' AND next_attempt_at <= now()
 		  ORDER BY next_attempt_at, id
 		  FOR UPDATE SKIP LOCKED
-		  LIMIT 1
+		  LIMIT $1
 		)
 		UPDATE account_queue AS queue
 		SET status='rest_fallback_running', fallback_attempts=fallback_attempts+1,
@@ -2449,39 +2462,80 @@ func (s *Store) ClaimRESTFallback(ctx context.Context) (*model.Candidate, error)
 		          queue.node_id, queue.login, queue.scan_id::text, queue.attempts,
 		          queue.fallback_attempts, queue.claim_token::text,
 		          queue.coverage_generation_id, queue.coverage_partition_id
-	`).Scan(
-		&job.QueueID, &job.RunID, &job.Source, &job.GitHubID,
-		&job.NodeID, &job.Login, &job.ScanID, &job.Attempts,
-		&job.FallbackAttempts, &job.ClaimToken,
-		&job.GenerationID, &job.PartitionID,
-	)
+	`, limit)
 	if err != nil {
 		return nil, err
 	}
-	return &job, nil
+	defer rows.Close()
+	jobs := make([]model.Candidate, 0, limit)
+	for rows.Next() {
+		var job model.Candidate
+		if err := rows.Scan(
+			&job.QueueID, &job.RunID, &job.Source, &job.GitHubID,
+			&job.NodeID, &job.Login, &job.ScanID, &job.Attempts,
+			&job.FallbackAttempts, &job.ClaimToken,
+			&job.GenerationID, &job.PartitionID,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(jobs) == 0 {
+		return nil, pgx.ErrNoRows
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].QueueID < jobs[j].QueueID })
+	return jobs, nil
 }
 
 func (s *Store) RequeueRESTFallbackAfter(
 	ctx context.Context, job model.Candidate, cause error, delay time.Duration,
 ) error {
+	return s.RequeueRESTFallbackBatchAfter(ctx, []model.Candidate{job}, cause, delay)
+}
+
+func (s *Store) RequeueRESTFallbackBatchAfter(
+	ctx context.Context,
+	jobs []model.Candidate,
+	cause error,
+	delay time.Duration,
+) error {
+	if len(jobs) == 0 {
+		return nil
+	}
 	if delay <= 0 {
+		attempts := 1
+		for _, job := range jobs {
+			attempts = max(attempts, job.FallbackAttempts)
+		}
 		delay = min(
-			time.Duration(1<<min(max(job.FallbackAttempts, 1)-1, 12))*5*time.Second,
+			time.Duration(1<<min(attempts-1, 12))*5*time.Second,
 			6*time.Hour,
 		)
 	}
+	ids := make([]int64, len(jobs))
+	tokens := make([]string, len(jobs))
+	for index, job := range jobs {
+		ids[index], tokens[index] = job.QueueID, job.ClaimToken
+	}
 	tag, err := s.Pool.Exec(ctx, `
-		UPDATE account_queue
+		UPDATE account_queue AS queue
 		SET status='rest_fallback', claimed_at=NULL, claim_token=NULL,
 		    lease_expires_at=NULL, next_attempt_at=now()+$3::interval,
 		    last_error=$4, last_error_at=now()
-		WHERE id=$1 AND claim_token::text=$2
-	`, job.QueueID, job.ClaimToken, pgInterval(delay), cause.Error())
+		FROM unnest($1::bigint[], $2::text[]) AS claimed(id, token)
+		WHERE queue.id=claimed.id AND queue.claim_token::text=claimed.token
+	`, ids, tokens, pgInterval(delay), cause.Error())
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return errors.New("stale REST fallback retry claim")
+	if tag.RowsAffected() != int64(len(jobs)) {
+		return fmt.Errorf(
+			"stale REST fallback retry claims: updated %d of %d",
+			tag.RowsAffected(), len(jobs),
+		)
 	}
 	return nil
 }
@@ -3967,8 +4021,8 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	var enumerationProcessedUsers int64
 	var enumerationRequests int64
 	var graphQLRequests int64
-	var restFallbackProcessedUsers int64
-	var restFallbackRequests int64
+	var resourceRepairProcessedUsers int64
+	var resourceRepairRequests int64
 	for index := range workers {
 		worker := workers[index]
 		if latestHeartbeat == nil || worker.HeartbeatAt.After(*latestHeartbeat) {
@@ -4010,9 +4064,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				value := *worker.LastSuccessAt
 				enumerationLastSuccessAt = &value
 			}
-		case "identity-safe REST key fallback":
-			restFallbackProcessedUsers += worker.ProcessedUsers
-			restFallbackRequests += worker.Requests
+		case "GraphQL URL-resource repair with REST fallback":
+			resourceRepairProcessedUsers += worker.ProcessedUsers
+			resourceRepairRequests += worker.Requests
 		}
 	}
 	var sessionUsersPerHour float64
@@ -4073,7 +4127,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	estimatedLow, _ := s.StateInt(ctx, "estimated_accounts_low")
 	estimatedHigh, _ := s.StateInt(ctx, "estimated_accounts_high")
 	enumerationWorkers, _ := s.StateInt(ctx, "enumeration_workers")
-	restFallbackWorkers, _ := s.StateInt(ctx, "rest_fallback_workers")
+	resourceRepairWorkers, _ := s.StateInt(ctx, "rest_fallback_workers")
 	if estimatedLow <= 0 {
 		estimatedLow = 190_000_000
 	}
@@ -4166,11 +4220,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			case active.EnumerationComplete && settlementBacklog == 0:
 				stage = "complete"
 			case !active.EnumerationComplete && restFallbackJobs > 0:
-				stage = "discovery_and_rest_repair"
+				stage = "discovery_and_resource_repair"
 			case unattemptedBacklog > 0:
 				stage = "graphql_indexing"
 			case settlementBacklog > 0:
-				stage = "rest_fallback_drain"
+				stage = "resource_repair_drain"
 			}
 			progress["stage"] = stage
 
@@ -4199,10 +4253,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				graphqlUsersPerRequest = float64(sessionProcessedUsers) /
 					float64(graphQLRequests)
 			}
-			restRequestsPerFallback := 0.0
-			if restFallbackProcessedUsers > 0 {
-				restRequestsPerFallback = float64(restFallbackRequests) /
-					float64(restFallbackProcessedUsers)
+			resourceUsersPerRequest := 0.0
+			if resourceRepairRequests > 0 {
+				resourceUsersPerRequest = float64(resourceRepairProcessedUsers) /
+					float64(resourceRepairRequests)
 			}
 
 			phased, phaseOK := estimatePhasedCompletion(phaseEstimateInput{
@@ -4221,8 +4275,12 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				GraphQLPerHour:             pacerConfiguredPerHour["graphql"],
 				EnumerationUsersPerRequest: enumerationUsersPerRequest,
 				GraphQLUsersPerRequest:     graphqlUsersPerRequest,
-				RESTRequestsPerFallback:    restRequestsPerFallback,
-				EnumerationRESTShare:       float64(enumerationWorkers) / float64(max(int64(1), enumerationWorkers+restFallbackWorkers)),
+				RESTRequestsPerFallback:    1,
+				EnumerationRESTShare:       0.95,
+				PrimaryGraphQLShare:        float64(enumerationWorkers) / float64(max(int64(1), enumerationWorkers+resourceRepairWorkers)),
+				ResourceUsersPerRequest:    resourceUsersPerRequest,
+				ResourceRESTFailureLow:     0,
+				ResourceRESTFailureHigh:    0.01,
 			})
 			if phaseOK {
 				fastFinishEarly := now.Add(time.Duration(phased.FastScanHoursLow * float64(time.Hour)))
@@ -4251,6 +4309,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 					"enumeration_users_per_request":      phased.EnumerationUsersPerRequest,
 					"graphql_users_per_request":          phased.GraphQLUsersPerRequest,
 					"rest_requests_per_fallback":         phased.RESTRequestsPerFallback,
+					"resource_users_per_request":         phased.ResourceUsersPerRequest,
+					"resource_rest_failure_low":          phased.ResourceRESTFailureLow,
+					"resource_rest_failure_high":         phased.ResourceRESTFailureHigh,
 					"rest_capacity_per_hour":             pacerConfiguredPerHour["rest"],
 					"graphql_capacity_per_hour":          pacerConfiguredPerHour["graphql"],
 					"remaining_rest_requests_low":        phased.RESTRequestsLow,
