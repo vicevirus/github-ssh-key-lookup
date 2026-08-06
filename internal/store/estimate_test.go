@@ -86,6 +86,37 @@ func TestEstimatePhasedCompletionRequiresBothCapacityBuckets(t *testing.T) {
 	}
 }
 
+func TestEstimatePhasedCompletionUsesMeasuredPrimaryThroughput(t *testing.T) {
+	estimate, ok := estimatePhasedCompletion(phaseEstimateInput{
+		EnumeratedUsers:             10_000,
+		AttemptedUsers:              10_000,
+		ProcessedUsers:              9_000,
+		EstimatedLow:                110_000,
+		EstimatedHigh:               110_000,
+		RESTPerHour:                 9_400,
+		GraphQLPerHour:              9_400,
+		GraphQLUsersPerRequest:      180,
+		ObservedPrimaryUsersPerHour: 540_000,
+		EnumerationUsersPerRequest:  100,
+		EnumerationIDsPerRequest:    100,
+		EnumerationRESTShare:        0.95,
+		PrimaryGraphQLShare:         0.90,
+		ResourceUsersPerRequest:     100,
+	})
+	if !ok {
+		t.Fatal("phase-aware estimate unavailable")
+	}
+	if estimate.GraphQLUsersPerRequest != 180 {
+		t.Fatalf("large measured batch was truncated: %#v", estimate)
+	}
+	if estimate.FastScanHoursLow < 0.18 || estimate.FastScanHoursLow > 0.19 {
+		t.Fatalf("measured throughput was not used: %#v", estimate)
+	}
+	if estimate.EffectiveUsersPerHour < 530_000 || estimate.EffectiveUsersPerHour > 550_000 {
+		t.Fatalf("unexpected effective measured rate: %#v", estimate)
+	}
+}
+
 func TestEstimatePhasedCompletionTreatsRepairAsReplayWork(t *testing.T) {
 	estimate, ok := estimatePhasedCompletion(phaseEstimateInput{
 		EnumeratedUsers:            72_000_000,

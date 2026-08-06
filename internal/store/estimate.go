@@ -3,29 +3,30 @@ package store
 import "math"
 
 type phaseEstimateInput struct {
-	EnumerationComplete        bool
-	EnumeratedUsers            int64
-	AttemptedUsers             int64
-	ProcessedUsers             int64
-	InaccessibleUsers          int64
-	RESTFallbackUsers          int64
-	RemainingShardIDs          int64
-	RepairRemainingIDs         int64
-	ObservedShardIDs           int64
-	ObservedShardUsers         int64
-	EstimatedLow               int64
-	EstimatedHigh              int64
-	RESTPerHour                float64
-	GraphQLPerHour             float64
-	EnumerationUsersPerRequest float64
-	EnumerationIDsPerRequest   float64
-	GraphQLUsersPerRequest     float64
-	RESTRequestsPerFallback    float64
-	EnumerationRESTShare       float64
-	PrimaryGraphQLShare        float64
-	ResourceUsersPerRequest    float64
-	ResourceRESTFailureLow     float64
-	ResourceRESTFailureHigh    float64
+	EnumerationComplete         bool
+	EnumeratedUsers             int64
+	AttemptedUsers              int64
+	ProcessedUsers              int64
+	InaccessibleUsers           int64
+	RESTFallbackUsers           int64
+	RemainingShardIDs           int64
+	RepairRemainingIDs          int64
+	ObservedShardIDs            int64
+	ObservedShardUsers          int64
+	EstimatedLow                int64
+	EstimatedHigh               int64
+	RESTPerHour                 float64
+	GraphQLPerHour              float64
+	ObservedPrimaryUsersPerHour float64
+	EnumerationUsersPerRequest  float64
+	EnumerationIDsPerRequest    float64
+	GraphQLUsersPerRequest      float64
+	RESTRequestsPerFallback     float64
+	EnumerationRESTShare        float64
+	PrimaryGraphQLShare         float64
+	ResourceUsersPerRequest     float64
+	ResourceRESTFailureLow      float64
+	ResourceRESTFailureHigh     float64
 }
 
 type phaseEstimate struct {
@@ -74,13 +75,20 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		input.EnumerationIDsPerRequest, 1, 1_000, 100,
 	)
 	graphqlUsersPerRequest := boundedRate(
-		input.GraphQLUsersPerRequest, 1, 100, 100,
+		input.GraphQLUsersPerRequest, 1, 250, 100,
 	)
 	restRequestsPerFallback := boundedRate(
 		input.RESTRequestsPerFallback, 1, 10, 1,
 	)
 	enumerationRESTShare := boundedRate(input.EnumerationRESTShare, 0.05, 1, 0.5)
 	primaryGraphQLShare := boundedRate(input.PrimaryGraphQLShare, 0.05, 1, 0.8)
+	primaryGraphQLUsersPerHour := input.GraphQLPerHour * primaryGraphQLShare *
+		graphqlUsersPerRequest
+	if input.ObservedPrimaryUsersPerHour > 0 {
+		primaryGraphQLUsersPerHour = math.Min(
+			primaryGraphQLUsersPerHour, input.ObservedPrimaryUsersPerHour,
+		)
+	}
 	resourceUsersPerRequest := boundedRate(input.ResourceUsersPerRequest, 1, 100, 100)
 	resourceRESTFailureLow := clamp(input.ResourceRESTFailureLow, 0, 1)
 	resourceRESTFailureHigh := clamp(
@@ -146,9 +154,8 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	enumerationRESTRequests := float64(input.RemainingShardIDs) / enumerationIDsPerRequest
 	fastScanRESTHoursLow := enumerationRESTRequests /
 		(input.RESTPerHour * enumerationRESTShare)
-	fastScanGraphQLHoursLow := (currentPrimaryGraphQLPoints +
-		float64(futureLow)/graphqlUsersPerRequest) /
-		(input.GraphQLPerHour * primaryGraphQLShare)
+	fastScanGraphQLHoursLow := (float64(nonRESTBacklog) + float64(futureLow)) /
+		primaryGraphQLUsersPerHour
 
 	futureResourceUsersLow := float64(futureLow) * fallbackRatioLow
 	futureResourceUsersHigh := float64(futureHigh) * fallbackRatioHigh
@@ -164,9 +171,8 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	const highOverhead = 1.10
 	fastScanRESTHoursHigh := enumerationRESTRequests *
 		highOverhead / (input.RESTPerHour * enumerationRESTShare)
-	fastScanGraphQLHoursHigh := (currentPrimaryGraphQLPoints +
-		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead /
-		(input.GraphQLPerHour * primaryGraphQLShare)
+	fastScanGraphQLHoursHigh := (float64(nonRESTBacklog) + float64(futureHigh)) *
+		highOverhead / primaryGraphQLUsersPerHour
 	restRequestsHigh := (currentRESTRequestsHigh +
 		enumerationRESTRequests +
 		futureResourceUsersHigh*resourceRESTFailureHigh*restRequestsPerFallback) * highOverhead
@@ -196,7 +202,7 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 
 	return phaseEstimate{
 		Basis:                      basis,
-		RateBasis:                  "phase-aware REST enumeration and GraphQL observation/resource-repair capacities",
+		RateBasis:                  "phase-aware REST enumeration and measured GraphQL observation/resource-repair capacities",
 		EstimatedTotalLow:          input.EnumeratedUsers + futureLow,
 		EstimatedTotalHigh:         input.EnumeratedUsers + futureHigh,
 		EstimatedFutureUsersLow:    futureLow,

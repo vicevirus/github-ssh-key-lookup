@@ -4710,8 +4710,6 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 	liveTailInitialized, _ := s.State(ctx, "live_tail_initialized")
 	estimatedLow, _ := s.StateInt(ctx, "estimated_accounts_low")
 	estimatedHigh, _ := s.StateInt(ctx, "estimated_accounts_high")
-	enumerationWorkers, _ := s.StateInt(ctx, "enumeration_workers")
-	resourceRepairWorkers, _ := s.StateInt(ctx, "rest_fallback_workers")
 	if estimatedLow <= 0 {
 		estimatedLow = 190_000_000
 	}
@@ -4853,31 +4851,40 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				resourceUsersPerRequest = float64(resourceRepairProcessedUsers) /
 					float64(resourceRepairRequests)
 			}
+			// The key scheduler reserves 90% for the unfinished global pass. A
+			// current session becomes representative after three minutes; before
+			// that, the persisted six-hour rate avoids startup spikes.
+			const primaryGraphQLShare = 0.90
+			observedPrimaryUsersPerHour := rollingSixHourAttempts
+			if sessionElapsedHours >= 3.0/60.0 && sessionUsersPerHour > 0 {
+				observedPrimaryUsersPerHour = sessionUsersPerHour * primaryGraphQLShare
+			}
 
 			phased, phaseOK := estimatePhasedCompletion(phaseEstimateInput{
-				EnumerationComplete:        active.EnumerationComplete,
-				EnumeratedUsers:            active.EnumeratedUsers,
-				AttemptedUsers:             attemptedUsers,
-				ProcessedUsers:             active.ProcessedUsers,
-				InaccessibleUsers:          active.InaccessibleUsers,
-				RESTFallbackUsers:          restFallbackJobs,
-				RemainingShardIDs:          remainingShardIDs,
-				RepairRemainingIDs:         repairRemainingIDs,
-				ObservedShardIDs:           observedShardIDs,
-				ObservedShardUsers:         observedShardUsers,
-				EstimatedLow:               estimatedLow,
-				EstimatedHigh:              estimatedHigh,
-				RESTPerHour:                pacerConfiguredPerHour["rest"],
-				GraphQLPerHour:             pacerConfiguredPerHour["graphql"],
-				EnumerationUsersPerRequest: enumerationUsersPerRequest,
-				EnumerationIDsPerRequest:   enumerationIDsPerRequest,
-				GraphQLUsersPerRequest:     graphqlUsersPerRequest,
-				RESTRequestsPerFallback:    1,
-				EnumerationRESTShare:       0.95,
-				PrimaryGraphQLShare:        float64(enumerationWorkers) / float64(max(int64(1), enumerationWorkers+resourceRepairWorkers)),
-				ResourceUsersPerRequest:    resourceUsersPerRequest,
-				ResourceRESTFailureLow:     0,
-				ResourceRESTFailureHigh:    0.01,
+				EnumerationComplete:         active.EnumerationComplete,
+				EnumeratedUsers:             active.EnumeratedUsers,
+				AttemptedUsers:              attemptedUsers,
+				ProcessedUsers:              active.ProcessedUsers,
+				InaccessibleUsers:           active.InaccessibleUsers,
+				RESTFallbackUsers:           restFallbackJobs,
+				RemainingShardIDs:           remainingShardIDs,
+				RepairRemainingIDs:          repairRemainingIDs,
+				ObservedShardIDs:            observedShardIDs,
+				ObservedShardUsers:          observedShardUsers,
+				EstimatedLow:                estimatedLow,
+				EstimatedHigh:               estimatedHigh,
+				RESTPerHour:                 pacerConfiguredPerHour["rest"],
+				GraphQLPerHour:              pacerConfiguredPerHour["graphql"],
+				ObservedPrimaryUsersPerHour: observedPrimaryUsersPerHour,
+				EnumerationUsersPerRequest:  enumerationUsersPerRequest,
+				EnumerationIDsPerRequest:    enumerationIDsPerRequest,
+				GraphQLUsersPerRequest:      graphqlUsersPerRequest,
+				RESTRequestsPerFallback:     1,
+				EnumerationRESTShare:        0.95,
+				PrimaryGraphQLShare:         primaryGraphQLShare,
+				ResourceUsersPerRequest:     resourceUsersPerRequest,
+				ResourceRESTFailureLow:      0,
+				ResourceRESTFailureHigh:     0.01,
 			})
 			if phaseOK {
 				fastFinishEarly := now.Add(time.Duration(phased.FastScanHoursLow * float64(time.Hour)))
