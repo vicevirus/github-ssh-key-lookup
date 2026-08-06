@@ -139,6 +139,31 @@ func TestCompactStatusPrefersFederationSweepETA(t *testing.T) {
 	}
 }
 
+func TestCompactStatusHidesPreliminaryFederationETA(t *testing.T) {
+	finish := time.Now().Add(90 * 24 * time.Hour)
+	snapshot := map[string]any{
+		"progress": map[string]any{"estimated_completion": map[string]any{}},
+		"federation_sweep": map[string]any{
+			"status": "running", "estimated_finish": finish,
+			"remaining_hours": 2160.0, "estimate_preliminary": true,
+		},
+		"crawler": map[string]any{"online": true}, "coverage": map[string]any{},
+		"recovery": map[string]any{}, "passes": map[string]any{},
+		"lookup": map[string]any{"usable": true}, "index": map[string]any{},
+	}
+
+	result := compactStatusSnapshot(snapshot)
+	progress := result["progress"].(map[string]any)
+	fastSweep := progress["fast_sweep"].(map[string]any)
+	if progress["estimated_finish_early"] != nil || fastSweep["estimated_finish"] != nil ||
+		fastSweep["remaining_hours"] != nil {
+		t.Fatalf("preliminary federation ETA was exposed: %#v", progress)
+	}
+	if snapshot["federation_sweep"].(map[string]any)["estimated_finish"] != finish {
+		t.Fatal("compact status mutated the cached internal snapshot")
+	}
+}
+
 func TestParsePaginationDefaultsAndBounds(t *testing.T) {
 	page, err := parsePagination(url.Values{})
 	if err != nil {

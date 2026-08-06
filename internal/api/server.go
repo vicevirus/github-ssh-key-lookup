@@ -176,6 +176,15 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	passes := anyMap(snapshot["passes"])
 	lookup := anyMap(snapshot["lookup"])
 	federation := anyMap(snapshot["federation_sweep"])
+	publicFederation := federation
+	if federation != nil {
+		// The compact response is public API data. Copy before hiding unstable
+		// startup estimates so the cached internal snapshot remains untouched.
+		publicFederation = make(map[string]any, len(federation))
+		for key, value := range federation {
+			publicFederation[key] = value
+		}
+	}
 	estimate := anyMap(progress["estimated_completion"])
 	fastFinishEarly := estimate["fast_scan_finish_early"]
 	fastFinishLate := estimate["fast_scan_finish_late"]
@@ -189,6 +198,8 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			// a short-window ETA actively misleading. Expose progress/rate now and
 			// publish the completion date after one measured hour.
 			fastFinishEarly, fastFinishLate = nil, nil
+			publicFederation["estimated_finish"] = nil
+			publicFederation["remaining_hours"] = nil
 		} else if finish := federation["estimated_finish"]; finish != nil {
 			fastFinishEarly, fastFinishLate = finish, finish
 		}
@@ -221,7 +232,7 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"keys":   index["keys"],
 		},
 		"progress": map[string]any{
-			"fast_sweep":             federation,
+			"fast_sweep":             publicFederation,
 			"enumerated_users":       progress["enumerated_users"],
 			"attempted_users":        progress["attempted_users"],
 			"processed_users":        progress["processed_users"],
