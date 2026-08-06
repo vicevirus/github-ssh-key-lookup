@@ -1266,11 +1266,16 @@ func sameKeySet(left, right []model.PublicKey) bool {
 }
 
 func (s *Service) nextQueueClass() string {
-	// Interleaving the slots avoids long bursts while preserving an 80/10/10
-	// request allocation. ClaimScheduledAccounts borrows from another class
-	// whenever the selected class cannot fill a batch.
+	// Interleaving the slots avoids long bursts while preserving a 90/5/5
+	// global/live/owner allocation. At current throughput, each 5% lane has
+	// more capacity than account arrivals or scheduled owner refreshes need.
+	// ClaimScheduledAccounts borrows from another class whenever the selected
+	// class cannot fill a batch, so unused maintenance capacity returns to the
+	// global pass immediately.
 	slots := [...]string{
+		"global", "global", "global", "global", "global",
 		"global", "global", "global", "global", "live",
+		"global", "global", "global", "global", "global",
 		"global", "global", "global", "global", "owner",
 	}
 	s.scheduleMu.Lock()

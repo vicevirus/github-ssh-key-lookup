@@ -244,7 +244,7 @@ func TestWeightedSchedulerAllocation(t *testing.T) {
 	for index := 0; index < 1_000; index++ {
 		counts[service.nextQueueClass()]++
 	}
-	if counts["global"] != 800 || counts["live"] != 100 || counts["owner"] != 100 {
+	if counts["global"] != 900 || counts["live"] != 50 || counts["owner"] != 50 {
 		t.Fatalf("unexpected weighted allocation: %#v", counts)
 	}
 }
