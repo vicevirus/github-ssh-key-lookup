@@ -1384,10 +1384,13 @@ func (s *Store) ApplyEnumerationShardPage(ctx context.Context, shard Enumeration
 		UPDATE enumeration_shards
 		SET next_since_id=$2, next_url=$3, status=$4,
 		    enumerated_users=enumerated_users+$5,
+		    pages_processed=pages_processed+1,
+		    observed_id_positions=observed_id_positions+GREATEST(0, $2-next_since_id),
+		    observed_users=observed_users+$6,
 		    claimed_at=CASE WHEN $4='completed' THEN NULL ELSE claimed_at END,
 		    completed_at=CASE WHEN $4='completed' THEN now() ELSE completed_at END
 		WHERE id=$1
-	`, shard.ID, nextSince, nextURL, status, inserted)
+	`, shard.ID, nextSince, nextURL, status, inserted, len(candidates))
 	if err != nil {
 		return err
 	}
@@ -3948,13 +3951,15 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		"remaining": 0,
 		"ranges":    []map[string]any{},
 	}
-	var remainingShardIDs, observedShardIDs, observedShardUsers int64
+	var remainingShardIDs, observedShardIDs, observedShardUsers, observedShardPages int64
+	var legacyObservedShardIDs, legacyObservedShardUsers int64
 	var repairEnumeratedUsers, repairRemainingIDs int64
 	var repairShards, repairShardsCompleted, repairShardsRemaining int
 	if len(runs) > 0 {
 		shardRows, err := s.Pool.Query(ctx, `
 			SELECT id, purpose, lower_id, upper_id, next_since_id, status,
-			       enumerated_users, attempts
+			       enumerated_users, attempts, pages_processed,
+			       observed_id_positions, observed_users
 			FROM enumeration_shards
 			WHERE run_id = $1
 			ORDER BY lower_id, id
@@ -3967,11 +3972,12 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		remaining := 0
 		for shardRows.Next() {
 			var id, lowerID, upperID, nextSince, enumerated int64
+			var pages, observedIDs, observedUsers int64
 			var purpose, status string
 			var attempts int
 			if err := shardRows.Scan(
 				&id, &purpose, &lowerID, &upperID, &nextSince, &status,
-				&enumerated, &attempts,
+				&enumerated, &attempts, &pages, &observedIDs, &observedUsers,
 			); err != nil {
 				shardRows.Close()
 				return nil, err
@@ -3980,10 +3986,13 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				completed++
 			} else {
 				remaining++
-				observedShardIDs += max(int64(0), nextSince-lowerID)
-				observedShardUsers += enumerated
 				remainingShardIDs += max(int64(0), upperID-nextSince)
+				legacyObservedShardIDs += max(int64(0), nextSince-lowerID)
+				legacyObservedShardUsers += enumerated
 			}
+			observedShardIDs += observedIDs
+			observedShardUsers += observedUsers
+			observedShardPages += pages
 			if purpose == "repair" {
 				repairShards++
 				repairEnumeratedUsers += enumerated
@@ -3999,6 +4008,9 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				"lower_id": lowerID, "upper_id": upperID,
 				"next_since_id": nextSince, "status": status,
 				"enumerated_users": enumerated, "attempts": attempts,
+				"pages_processed":       pages,
+				"observed_id_positions": observedIDs,
+				"observed_users":        observedUsers,
 			})
 		}
 		if err := shardRows.Err(); err != nil {
@@ -4006,6 +4018,14 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			return nil, err
 		}
 		shardRows.Close()
+		// Existing shards created before page metrics were introduced still
+		// provide a useful density sample through their durable checkpoint and
+		// inserted-user counter. Stop using this compatibility sample as soon as
+		// real page observations are available.
+		if observedShardPages == 0 {
+			observedShardIDs = legacyObservedShardIDs
+			observedShardUsers = legacyObservedShardUsers
+		}
 		shardStatus = map[string]any{
 			"count": len(ranges), "completed": completed,
 			"remaining": remaining, "ranges": ranges,
@@ -4372,6 +4392,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				enumerationUsersPerRequest = float64(enumerationProcessedUsers) /
 					float64(enumerationRequests)
 			}
+			enumerationIDsPerRequest := 0.0
+			if observedShardPages > 0 {
+				enumerationIDsPerRequest = float64(observedShardIDs) /
+					float64(observedShardPages)
+			}
 			graphqlUsersPerRequest := 0.0
 			if graphQLRequests > 0 {
 				graphqlUsersPerRequest = float64(sessionProcessedUsers) /
@@ -4391,6 +4416,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				InaccessibleUsers:          active.InaccessibleUsers,
 				RESTFallbackUsers:          restFallbackJobs,
 				RemainingShardIDs:          remainingShardIDs,
+				RepairRemainingIDs:         repairRemainingIDs,
 				ObservedShardIDs:           observedShardIDs,
 				ObservedShardUsers:         observedShardUsers,
 				EstimatedLow:               estimatedLow,
@@ -4398,6 +4424,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				RESTPerHour:                pacerConfiguredPerHour["rest"],
 				GraphQLPerHour:             pacerConfiguredPerHour["graphql"],
 				EnumerationUsersPerRequest: enumerationUsersPerRequest,
+				EnumerationIDsPerRequest:   enumerationIDsPerRequest,
 				GraphQLUsersPerRequest:     graphqlUsersPerRequest,
 				RESTRequestsPerFallback:    1,
 				EnumerationRESTShare:       0.95,
@@ -4431,6 +4458,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 					"observed_rest_fallback_ratio":       phased.FallbackRatioLow,
 					"estimated_rest_fallback_ratio_high": phased.FallbackRatioHigh,
 					"enumeration_users_per_request":      phased.EnumerationUsersPerRequest,
+					"enumeration_ids_per_request":        phased.EnumerationIDsPerRequest,
 					"graphql_users_per_request":          phased.GraphQLUsersPerRequest,
 					"rest_requests_per_fallback":         phased.RESTRequestsPerFallback,
 					"resource_users_per_request":         phased.ResourceUsersPerRequest,

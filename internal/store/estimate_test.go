@@ -85,3 +85,36 @@ func TestEstimatePhasedCompletionRequiresBothCapacityBuckets(t *testing.T) {
 		t.Fatal("estimate should wait until both pacer capacities are known")
 	}
 }
+
+func TestEstimatePhasedCompletionTreatsRepairAsReplayWork(t *testing.T) {
+	estimate, ok := estimatePhasedCompletion(phaseEstimateInput{
+		EnumeratedUsers:            72_000_000,
+		AttemptedUsers:             72_000_000,
+		ProcessedUsers:             72_000_000,
+		RemainingShardIDs:          234_000_000,
+		RepairRemainingIDs:         226_000_000,
+		EstimatedLow:               170_000_000,
+		EstimatedHigh:              210_000_000,
+		RESTPerHour:                9_400,
+		GraphQLPerHour:             9_400,
+		EnumerationIDsPerRequest:   105,
+		EnumerationUsersPerRequest: 80,
+		GraphQLUsersPerRequest:     100,
+		EnumerationRESTShare:       0.95,
+		PrimaryGraphQLShare:        0.8,
+		ResourceUsersPerRequest:    100,
+	})
+	if !ok {
+		t.Fatal("phase-aware estimate unavailable")
+	}
+	if estimate.EstimatedTotalLow != 170_000_000 ||
+		estimate.EstimatedTotalHigh != 210_000_000 {
+		t.Fatalf("repair replay was counted as new accounts: %#v", estimate)
+	}
+	if estimate.FastScanHoursLow < 240 || estimate.FastScanHoursLow > 260 {
+		t.Fatalf("REST replay time was not based on ID/page throughput: %#v", estimate)
+	}
+	if estimate.EnumerationIDsPerRequest != 105 {
+		t.Fatalf("measured ID/page throughput was not retained: %#v", estimate)
+	}
+}

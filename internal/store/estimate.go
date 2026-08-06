@@ -10,6 +10,7 @@ type phaseEstimateInput struct {
 	InaccessibleUsers          int64
 	RESTFallbackUsers          int64
 	RemainingShardIDs          int64
+	RepairRemainingIDs         int64
 	ObservedShardIDs           int64
 	ObservedShardUsers         int64
 	EstimatedLow               int64
@@ -17,6 +18,7 @@ type phaseEstimateInput struct {
 	RESTPerHour                float64
 	GraphQLPerHour             float64
 	EnumerationUsersPerRequest float64
+	EnumerationIDsPerRequest   float64
 	GraphQLUsersPerRequest     float64
 	RESTRequestsPerFallback    float64
 	EnumerationRESTShare       float64
@@ -51,6 +53,7 @@ type phaseEstimate struct {
 	GraphQLHoursLow            float64
 	GraphQLHoursHigh           float64
 	EnumerationUsersPerRequest float64
+	EnumerationIDsPerRequest   float64
 	GraphQLUsersPerRequest     float64
 	RESTRequestsPerFallback    float64
 	ResourceUsersPerRequest    float64
@@ -66,6 +69,9 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 
 	enumerationUsersPerRequest := boundedRate(
 		input.EnumerationUsersPerRequest, 1, 100, 90,
+	)
+	enumerationIDsPerRequest := boundedRate(
+		input.EnumerationIDsPerRequest, 1, 1_000, 100,
 	)
 	graphqlUsersPerRequest := boundedRate(
 		input.GraphQLUsersPerRequest, 1, 100, 100,
@@ -89,6 +95,15 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	preliminary := input.AttemptedUsers < 1_000_000
 	if !input.EnumerationComplete {
 		switch {
+		case input.RepairRemainingIDs > 0:
+			// A repair shard replays an ID range and upserts observations that
+			// may already exist. It is incorrect to count every replay position
+			// as a new account. Use the planning population envelope for new
+			// GraphQL work; REST replay work is accounted for separately below.
+			futureLow = max(int64(0), input.EstimatedLow-input.EnumeratedUsers)
+			futureHigh = max(futureLow, input.EstimatedHigh-input.EnumeratedUsers)
+			basis = "phase-aware repair replay and planning population envelope"
+			preliminary = true
 		case input.RemainingShardIDs > 0 && input.ObservedShardIDs > 0:
 			density := clamp(
 				float64(input.ObservedShardUsers)/float64(input.ObservedShardIDs), 0, 1,
@@ -128,7 +143,8 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	currentPrimaryGraphQLPoints := float64(nonRESTBacklog) / graphqlUsersPerRequest
 	currentGraphQLPoints := currentPrimaryGraphQLPoints +
 		currentResourceUsers/resourceUsersPerRequest
-	fastScanRESTHoursLow := (float64(futureLow) / enumerationUsersPerRequest) /
+	enumerationRESTRequests := float64(input.RemainingShardIDs) / enumerationIDsPerRequest
+	fastScanRESTHoursLow := enumerationRESTRequests /
 		(input.RESTPerHour * enumerationRESTShare)
 	fastScanGraphQLHoursLow := (currentPrimaryGraphQLPoints +
 		float64(futureLow)/graphqlUsersPerRequest) /
@@ -137,7 +153,7 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	futureResourceUsersLow := float64(futureLow) * fallbackRatioLow
 	futureResourceUsersHigh := float64(futureHigh) * fallbackRatioHigh
 	restRequestsLow := currentRESTRequestsLow +
-		float64(futureLow)/enumerationUsersPerRequest +
+		enumerationRESTRequests +
 		futureResourceUsersLow*resourceRESTFailureLow*restRequestsPerFallback
 	graphqlPointsLow := currentGraphQLPoints + float64(futureLow)/graphqlUsersPerRequest +
 		futureResourceUsersLow/resourceUsersPerRequest
@@ -146,13 +162,13 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 	// pacers already reserve primary quota; this margin is for retries, key-page
 	// pagination, tail traffic, and API variance.
 	const highOverhead = 1.10
-	fastScanRESTHoursHigh := (float64(futureHigh) / enumerationUsersPerRequest) *
+	fastScanRESTHoursHigh := enumerationRESTRequests *
 		highOverhead / (input.RESTPerHour * enumerationRESTShare)
 	fastScanGraphQLHoursHigh := (currentPrimaryGraphQLPoints +
 		float64(futureHigh)/graphqlUsersPerRequest) * highOverhead /
 		(input.GraphQLPerHour * primaryGraphQLShare)
 	restRequestsHigh := (currentRESTRequestsHigh +
-		float64(futureHigh)/enumerationUsersPerRequest +
+		enumerationRESTRequests +
 		futureResourceUsersHigh*resourceRESTFailureHigh*restRequestsPerFallback) * highOverhead
 	graphqlPointsHigh := (currentGraphQLPoints +
 		float64(futureHigh)/graphqlUsersPerRequest +
@@ -203,6 +219,7 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		GraphQLHoursLow:            graphqlHoursLow,
 		GraphQLHoursHigh:           graphqlHoursHigh,
 		EnumerationUsersPerRequest: enumerationUsersPerRequest,
+		EnumerationIDsPerRequest:   enumerationIDsPerRequest,
 		GraphQLUsersPerRequest:     graphqlUsersPerRequest,
 		RESTRequestsPerFallback:    restRequestsPerFallback,
 		ResourceUsersPerRequest:    resourceUsersPerRequest,
