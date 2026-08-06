@@ -4602,7 +4602,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 			// Stopped workers still provide the last completed session's
 			// throughput, but do not count toward crawler liveness.
 		} else if worker.State == "running" && worker.Name != "scheduler" {
-			if now.Sub(worker.HeartbeatAt) <= 90*time.Second {
+			// Workers can legitimately block for several minutes in a shared
+			// GitHub cooldown or an idle polling interval. The run watchdog uses
+			// actual due-work progress at ten minutes, so use the same boundary
+			// here instead of reporting healthy paced workers as stale.
+			if now.Sub(worker.HeartbeatAt) <= 10*time.Minute {
 				activeWorkers++
 			} else {
 				staleWorkers++
