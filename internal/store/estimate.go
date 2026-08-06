@@ -128,22 +128,12 @@ func estimatePhasedCompletion(input phaseEstimateInput) (phaseEstimate, bool) {
 		}
 	}
 
-	// Historical null-node observations provide a durable estimate of how many
-	// future accounts need the URL-resource resolver. Those repairs are batched
-	// in GraphQL; only the small URL-null or identity-mismatch remainder uses
-	// an individual REST verification.
-	fallbackSample := input.InaccessibleUsers + input.RESTFallbackUsers
-	fallbackRatioLow := 0.10
-	if input.AttemptedUsers > 0 {
-		fallbackRatioLow = clamp(
-			float64(fallbackSample)/float64(input.AttemptedUsers), 0.001, 1,
-		)
-	}
-	// The upper estimate covers retries and drift in the remaining ranges.
-	fallbackRatioHigh := clamp(
-		math.Max(fallbackRatioLow*1.20, fallbackRatioLow+0.02),
-		fallbackRatioLow, 1,
-	)
+	// Legacy inaccessible counts came from the former node-ID query and do not
+	// predict nulls from the current database-ID federation query. Live batches
+	// show a sub-percent null/identity-repair rate. Keep a bounded 0.1%-0.5%
+	// envelope and account for every upper-bound repair as REST below.
+	fallbackRatioLow := 0.001
+	fallbackRatioHigh := 0.005
 
 	currentResourceUsers := float64(input.RESTFallbackUsers)
 	currentRESTRequestsLow := currentResourceUsers * resourceRESTFailureLow * restRequestsPerFallback

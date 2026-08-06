@@ -4884,7 +4884,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				PrimaryGraphQLShare:         primaryGraphQLShare,
 				ResourceUsersPerRequest:     resourceUsersPerRequest,
 				ResourceRESTFailureLow:      0,
-				ResourceRESTFailureHigh:     0.01,
+				ResourceRESTFailureHigh:     1,
 			})
 			if phaseOK {
 				fastFinishEarly := now.Add(time.Duration(phased.FastScanHoursLow * float64(time.Hour)))

@@ -36,9 +36,6 @@ func TestEstimatePhasedCompletionDoesNotApplyRESTDrainRateToEveryAccount(t *test
 		estimate.RemainingHoursHigh > 105 {
 		t.Fatalf("unexpected late estimate: %#v", estimate)
 	}
-	if estimate.GraphQLHoursLow <= estimate.RESTHoursLow {
-		t.Fatalf("batched GraphQL observation/repair should be the measured bottleneck: %#v", estimate)
-	}
 	if estimate.EffectiveUsersPerHour < 700_000 || estimate.EffectiveUsersPerHour > 900_000 {
 		t.Fatalf("unexpected sustainable throughput: %#v", estimate)
 	}
@@ -114,6 +111,33 @@ func TestEstimatePhasedCompletionUsesMeasuredPrimaryThroughput(t *testing.T) {
 	}
 	if estimate.EffectiveUsersPerHour < 530_000 || estimate.EffectiveUsersPerHour > 550_000 {
 		t.Fatalf("unexpected effective measured rate: %#v", estimate)
+	}
+}
+
+func TestEstimatePhasedCompletionIgnoresLegacyInaccessibleRatio(t *testing.T) {
+	estimate, ok := estimatePhasedCompletion(phaseEstimateInput{
+		EnumeratedUsers:             10_000_000,
+		AttemptedUsers:              10_000_000,
+		ProcessedUsers:              10_000_000,
+		InaccessibleUsers:           5_000_000,
+		EstimatedLow:                20_000_000,
+		EstimatedHigh:               20_000_000,
+		RESTPerHour:                 9_400,
+		GraphQLPerHour:              9_400,
+		ObservedPrimaryUsersPerHour: 500_000,
+		EnumerationUsersPerRequest:  100,
+		EnumerationIDsPerRequest:    100,
+		GraphQLUsersPerRequest:      200,
+		EnumerationRESTShare:        0.95,
+		PrimaryGraphQLShare:         0.90,
+		ResourceUsersPerRequest:     1,
+		ResourceRESTFailureHigh:     1,
+	})
+	if !ok {
+		t.Fatal("phase-aware estimate unavailable")
+	}
+	if estimate.FallbackRatioLow != 0.001 || estimate.FallbackRatioHigh != 0.005 {
+		t.Fatalf("legacy inaccessible observations poisoned the future rate: %#v", estimate)
 	}
 }
 
