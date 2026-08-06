@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -16,7 +17,10 @@ func TestCrawlerServiceScalesPerCredentialSettings(t *testing.T) {
 	t.Setenv("GRAPHQL_POINTS_PER_HOUR", "4700")
 	t.Setenv("SEARCH_REQUESTS_PER_HOUR", "1500")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service := crawlerService(nil, logger)
+	service, err := crawlerService(context.Background(), nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if service.GitHub.CredentialCount() != 2 {
 		t.Fatalf("credential count=%d, want 2", service.GitHub.CredentialCount())
 	}

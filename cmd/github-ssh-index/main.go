@@ -93,9 +93,16 @@ func run() error {
 	case "api":
 		return api.New(database, logger).ListenAndServe(ctx, env("HTTP_ADDR", ":8080"))
 	case "crawl":
-		return crawlerService(database, logger).Run(ctx)
+		service, err := crawlerService(ctx, database, logger)
+		if err != nil {
+			return err
+		}
+		return service.Run(ctx)
 	case "all":
-		service := crawlerService(database, logger)
+		service, err := crawlerService(ctx, database, logger)
+		if err != nil {
+			return err
+		}
 		errors := make(chan error, 2)
 		go func() { errors <- service.Run(ctx) }()
 		go func() { errors <- api.New(database, logger).ListenAndServe(ctx, env("HTTP_ADDR", ":8080")) }()
@@ -110,14 +117,19 @@ func run() error {
 	}
 }
 
-func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service {
+func crawlerService(
+	ctx context.Context, database *store.Store, logger *slog.Logger,
+) (*crawler.Service, error) {
 	tokens := githubTokens()
-	if len(tokens) == 0 || tokens[0] == "" {
-		logger.Error("GITHUB_TOKEN is required for crawler mode")
-		os.Exit(2)
+	userAgent := env("GITHUB_USER_AGENT", "github-ssh-index/1.0 (security research; contact required)")
+	client := githubapi.NewWithTokens(tokens, userAgent)
+	if err := addGitHubAppCredential(ctx, client, userAgent); err != nil {
+		return nil, err
 	}
-	client := githubapi.NewWithTokens(tokens, env("GITHUB_USER_AGENT", "github-ssh-index/1.0 (security research; contact required)"))
 	credentialCount := client.CredentialCount()
+	if credentialCount == 0 {
+		return nil, errors.New("at least one GitHub PAT or App installation credential is required")
+	}
 	if value := os.Getenv("GITHUB_REST_BASE"); value != "" {
 		client.RESTBase = value
 	}
@@ -162,7 +174,47 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	config.EstimatedAccountsHigh = int64(envInt(
 		"ESTIMATED_ACCOUNTS_HIGH", int(config.EstimatedAccountsHigh),
 	))
-	return crawler.New(database, client, config, logger)
+	return crawler.New(database, client, config, logger), nil
+}
+
+func addGitHubAppCredential(
+	ctx context.Context, client *githubapi.Client, userAgent string,
+) error {
+	appIDText := strings.TrimSpace(os.Getenv("GITHUB_APP_ID"))
+	installationIDText := strings.TrimSpace(os.Getenv("GITHUB_APP_INSTALLATION_ID"))
+	privateKeyPath := strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"))
+	if appIDText == "" && installationIDText == "" && privateKeyPath == "" {
+		return nil
+	}
+	if appIDText == "" || installationIDText == "" || privateKeyPath == "" {
+		return errors.New(
+			"GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, and GITHUB_APP_PRIVATE_KEY_PATH must be set together",
+		)
+	}
+	appID, err := strconv.ParseInt(appIDText, 10, 64)
+	if err != nil || appID <= 0 {
+		return fmt.Errorf("invalid GITHUB_APP_ID %q", appIDText)
+	}
+	installationID, err := strconv.ParseInt(installationIDText, 10, 64)
+	if err != nil || installationID <= 0 {
+		return fmt.Errorf("invalid GITHUB_APP_INSTALLATION_ID %q", installationIDText)
+	}
+	privateKey, err := os.ReadFile(privateKeyPath)
+	if err != nil {
+		return fmt.Errorf("read GitHub App private key: %w", err)
+	}
+	source, err := githubapi.NewInstallationTokenSource(
+		appID, installationID, privateKey, userAgent,
+	)
+	if err != nil {
+		return err
+	}
+	// Fail startup cleanly on a revoked key or removed installation. Existing
+	// containers keep running until the replacement has passed this check.
+	if _, err := source.Token(ctx); err != nil {
+		return fmt.Errorf("validate GitHub App installation credential: %w", err)
+	}
+	return client.AddCredentialSource(source)
 }
 
 func githubTokens() []string {

@@ -123,7 +123,7 @@ type Client struct {
 }
 
 type credential struct {
-	token    string
+	source   CredentialSource
 	disabled bool
 }
 
@@ -254,6 +254,7 @@ func New(token, userAgent string) *Client {
 func NewWithTokens(tokens []string, userAgent string) *Client {
 	unique := make([]credential, 0, len(tokens))
 	seen := make(map[string]struct{}, len(tokens))
+	primary := ""
 	for _, token := range tokens {
 		token = strings.TrimSpace(token)
 		if token == "" {
@@ -263,11 +264,10 @@ func NewWithTokens(tokens []string, userAgent string) *Client {
 			continue
 		}
 		seen[token] = struct{}{}
-		unique = append(unique, credential{token: token})
-	}
-	primary := ""
-	if len(unique) != 0 {
-		primary = unique[0].token
+		if primary == "" {
+			primary = token
+		}
+		unique = append(unique, credential{source: &staticCredentialSource{token: token}})
 	}
 	return &Client{
 		Token:       primary,
@@ -285,6 +285,18 @@ func NewWithTokens(tokens []string, userAgent string) *Client {
 			},
 		},
 	}
+}
+
+// AddCredentialSource adds one independently rate-limited credential lane.
+// It must be called before crawler workers start.
+func (c *Client) AddCredentialSource(source CredentialSource) error {
+	if source == nil {
+		return errors.New("GitHub credential source is nil")
+	}
+	c.credentialsMu.Lock()
+	c.credentials = append(c.credentials, credential{source: source})
+	c.credentialsMu.Unlock()
+	return nil
 }
 
 func (c *Client) CredentialCount() int {
@@ -887,20 +899,17 @@ func (c *Client) headers(req *http.Request) {
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if forced, ok := req.Context().Value(credentialContextKey{}).(int); ok {
-		token, active := c.credential(forced)
-		if !active {
-			return nil, errors.New("selected GitHub credential is disabled")
-		}
-		attempt, err := replayRequest(req)
-		if err != nil {
-			return nil, err
-		}
-		attempt.Header.Set("Authorization", "Bearer "+token)
-		response, err := c.HTTP.Do(attempt)
+		response, err := c.doWithCredential(req, forced)
 		if err != nil {
 			return nil, err
 		}
 		if response.StatusCode == http.StatusUnauthorized {
+			source, active := c.credentialSource(forced)
+			if active && !source.DisableOnUnauthorized() {
+				response.Body.Close()
+				source.Invalidate()
+				return c.doWithCredential(req, forced)
+			}
 			c.disableCredential(forced)
 		}
 		return response, nil
@@ -911,20 +920,13 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("GitHub credential pool is empty")
 	}
 	var lastUnauthorized *http.Response
+	var lastSourceError error
 	for offset := 0; offset < count; offset++ {
 		index := (start + offset) % count
-		token, active := c.credential(index)
-		if !active {
+		response, err := c.doWithCredential(req, index)
+		if err != nil {
+			lastSourceError = err
 			continue
-		}
-		attempt, err := replayRequest(req)
-		if err != nil {
-			return nil, err
-		}
-		attempt.Header.Set("Authorization", "Bearer "+token)
-		response, err := c.HTTP.Do(attempt)
-		if err != nil {
-			return nil, err
 		}
 		if response.StatusCode != http.StatusUnauthorized {
 			if lastUnauthorized != nil {
@@ -932,16 +934,56 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 			}
 			return response, nil
 		}
+		source, active := c.credentialSource(index)
+		if active && !source.DisableOnUnauthorized() {
+			response.Body.Close()
+			source.Invalidate()
+			response, err = c.doWithCredential(req, index)
+			if err != nil {
+				lastSourceError = err
+				continue
+			}
+			if response.StatusCode != http.StatusUnauthorized {
+				if lastUnauthorized != nil {
+					lastUnauthorized.Body.Close()
+				}
+				return response, nil
+			}
+		} else {
+			c.disableCredential(index)
+		}
 		if lastUnauthorized != nil {
 			lastUnauthorized.Body.Close()
 		}
 		lastUnauthorized = response
-		c.disableCredential(index)
 	}
 	if lastUnauthorized != nil {
 		return lastUnauthorized, nil
 	}
+	if lastSourceError != nil {
+		return nil, fmt.Errorf("all GitHub credential sources unavailable: %w", lastSourceError)
+	}
 	return nil, errors.New("all GitHub credentials are disabled")
+}
+
+func (c *Client) doWithCredential(req *http.Request, index int) (*http.Response, error) {
+	source, active := c.credentialSource(index)
+	if !active {
+		return nil, fmt.Errorf("GitHub credential lane %d is disabled", index+1)
+	}
+	token, err := source.Token(req.Context())
+	if err != nil {
+		return nil, fmt.Errorf("GitHub credential lane %d: %w", index+1, err)
+	}
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("GitHub credential lane %d returned an empty token", index+1)
+	}
+	attempt, err := replayRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	attempt.Header.Set("Authorization", "Bearer "+token)
+	return c.HTTP.Do(attempt)
 }
 
 func (c *Client) nextCredential(req *http.Request) int {
@@ -957,13 +999,13 @@ func (c *Client) nextCredential(req *http.Request) int {
 	return int(next.Add(1) - 1)
 }
 
-func (c *Client) credential(index int) (string, bool) {
+func (c *Client) credentialSource(index int) (CredentialSource, bool) {
 	c.credentialsMu.RLock()
 	defer c.credentialsMu.RUnlock()
 	if index < 0 || index >= len(c.credentials) || c.credentials[index].disabled {
-		return "", false
+		return nil, false
 	}
-	return c.credentials[index].token, true
+	return c.credentials[index].source, true
 }
 
 func (c *Client) disableCredential(index int) {

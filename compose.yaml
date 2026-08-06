@@ -75,6 +75,9 @@ services:
       DATABASE_URL: postgres://github_ssh_index:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/github_ssh_index?sslmode=disable&connect_timeout=5
       GITHUB_TOKEN: ${GITHUB_TOKEN:?Set GITHUB_TOKEN in .env}
       GITHUB_TOKEN_SECONDARY: ${GITHUB_TOKEN_SECONDARY:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
       GITHUB_USER_AGENT: ${GITHUB_USER_AGENT:-github-cli}
       GRAPHQL_WORKERS: ${GRAPHQL_WORKERS:-3}
       REST_ENUMERATION_WORKERS: ${REST_ENUMERATION_WORKERS:-1}
@@ -101,6 +104,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid
+    volumes:
+      - ${GITHUB_APP_PRIVATE_KEY_FILE:-/dev/null}:${GITHUB_APP_PRIVATE_KEY_PATH:-/run/secrets/github_app_private_key.pem}:ro
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
