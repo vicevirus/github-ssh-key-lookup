@@ -61,6 +61,34 @@ type EnumerationShard struct {
 	CoverageGenerationID *int64
 }
 
+type EntitySweepRun struct {
+	ID             int64
+	Kind           string
+	LowerID        int64
+	UpperID        int64
+	Status         string
+	BatchSize      int
+	Requests       int64
+	ResolvedUsers  int64
+	KeyOwners      int64
+	KeysObserved   int64
+	StartedAt      time.Time
+	LastProgressAt *time.Time
+	CompletedAt    *time.Time
+}
+
+type EntitySweepShard struct {
+	ID         int64
+	RunID      int64
+	LowerID    int64
+	UpperID    int64
+	NextID     int64
+	Status     string
+	BatchSize  int
+	Attempts   int
+	ClaimToken string
+}
+
 const coverageChunkSize int64 = 8192
 
 func coverageBitField(field string) (string, error) {
@@ -867,6 +895,12 @@ func (s *Store) Recover(ctx context.Context) error {
 		    last_error = COALESCE(last_error, 'recovered after restart'),
 		    last_error_at = now()
 		WHERE status = 'running';
+		UPDATE entity_sweep_shards
+		SET status = 'retry', claimed_at = NULL, claim_token = NULL,
+		    lease_expires_at = NULL,
+		    last_error = COALESCE(last_error, 'recovered after restart'),
+		    last_error_at = now()
+		WHERE status = 'running';
 	`)
 	return err
 }
@@ -1539,6 +1573,296 @@ func (s *Store) RequeueEnumerationShard(ctx context.Context, shard EnumerationSh
 	return err
 }
 
+func scanEntitySweepRun(row rowScanner) (EntitySweepRun, error) {
+	var run EntitySweepRun
+	err := row.Scan(
+		&run.ID, &run.Kind, &run.LowerID, &run.UpperID, &run.Status,
+		&run.BatchSize, &run.Requests, &run.ResolvedUsers, &run.KeyOwners,
+		&run.KeysObserved, &run.StartedAt, &run.LastProgressAt, &run.CompletedAt,
+	)
+	return run, err
+}
+
+// EnsureEntitySweepRun creates the next durable dense-ID sweep when there is
+// no active one. New IDs are caught first; once caught up, a full recurring
+// reconciliation ensures accounts that previously had zero keys are revisited.
+func (s *Store) EnsureEntitySweepRun(
+	ctx context.Context, shardCount, batchSize int, recrawl time.Duration,
+) (EntitySweepRun, error) {
+	if shardCount < 1 {
+		shardCount = 1
+	}
+	if shardCount > 64 {
+		shardCount = 64
+	}
+	batchSize = min(max(batchSize, 25), 250)
+	if recrawl <= 0 {
+		recrawl = 30 * 24 * time.Hour
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return EntitySweepRun{}, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(742910238554)`); err != nil {
+		return EntitySweepRun{}, err
+	}
+	active, err := scanEntitySweepRun(tx.QueryRow(ctx, `
+		SELECT id, kind, lower_id, upper_id, status, batch_size, requests,
+		       resolved_users, key_owners, keys_observed, started_at,
+		       last_progress_at, completed_at
+		FROM entity_sweep_runs WHERE status='running' ORDER BY id DESC LIMIT 1
+	`))
+	if err == nil {
+		return active, tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return EntitySweepRun{}, err
+	}
+	var highwater int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((SELECT value::bigint FROM runtime_state
+		                 WHERE key='tail_highwater'), 0)
+	`).Scan(&highwater); err != nil {
+		return EntitySweepRun{}, err
+	}
+	if highwater < 1 {
+		return EntitySweepRun{}, pgx.ErrNoRows
+	}
+	var maximumUpper int64
+	var lastFullCompleted *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(upper_id), 0),
+		       MAX(completed_at) FILTER (WHERE lower_id=1 AND status='completed')
+		FROM entity_sweep_runs
+	`).Scan(&maximumUpper, &lastFullCompleted); err != nil {
+		return EntitySweepRun{}, err
+	}
+	lowerID, upperID, kind := int64(1), highwater, "initial"
+	switch {
+	case maximumUpper == 0:
+	case maximumUpper < highwater:
+		lowerID, kind = maximumUpper+1, "tail"
+	case lastFullCompleted == nil || time.Since(*lastFullCompleted) >= recrawl:
+		kind = "reconcile"
+	default:
+		return EntitySweepRun{}, pgx.ErrNoRows
+	}
+	run, err := scanEntitySweepRun(tx.QueryRow(ctx, `
+		INSERT INTO entity_sweep_runs (kind, lower_id, upper_id, batch_size)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, kind, lower_id, upper_id, status, batch_size, requests,
+		          resolved_users, key_owners, keys_observed, started_at,
+		          last_progress_at, completed_at
+	`, kind, lowerID, upperID, batchSize))
+	if err != nil {
+		return EntitySweepRun{}, err
+	}
+	total := upperID - lowerID + 1
+	pieces := min(int64(shardCount*4), total)
+	for part := int64(0); part < pieces; part++ {
+		lower := lowerID + total*part/pieces
+		upper := lowerID + total*(part+1)/pieces - 1
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO entity_sweep_shards (
+			  run_id, lower_id, upper_id, next_id, batch_size
+			) VALUES ($1, $2, $3, $2, $4)
+		`, run.ID, lower, upper, batchSize); err != nil {
+			return EntitySweepRun{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return EntitySweepRun{}, err
+	}
+	return run, nil
+}
+
+func (s *Store) ClaimEntitySweepShard(ctx context.Context) (EntitySweepShard, error) {
+	row := s.Pool.QueryRow(ctx, `
+		WITH picked AS (
+		  SELECT shard.id
+		  FROM entity_sweep_shards AS shard
+		  JOIN entity_sweep_runs AS run ON run.id=shard.run_id
+		  WHERE run.status='running' AND shard.status IN ('pending','retry')
+		  ORDER BY shard.next_id, shard.id
+		  FOR UPDATE OF shard SKIP LOCKED LIMIT 1
+		)
+		UPDATE entity_sweep_shards AS shard
+		SET status='running', attempts=attempts+1, claim_token=gen_random_uuid(),
+		    claimed_at=now(), lease_expires_at=now()+interval '2 hours',
+		    last_error=NULL, last_error_at=NULL
+		FROM picked WHERE shard.id=picked.id
+		RETURNING shard.id, shard.run_id, shard.lower_id, shard.upper_id,
+		          shard.next_id, shard.status, shard.batch_size, shard.attempts,
+		          shard.claim_token::text
+	`)
+	var shard EntitySweepShard
+	err := row.Scan(
+		&shard.ID, &shard.RunID, &shard.LowerID, &shard.UpperID,
+		&shard.NextID, &shard.Status, &shard.BatchSize, &shard.Attempts,
+		&shard.ClaimToken,
+	)
+	return shard, err
+}
+
+// StageEntitySweepResults creates durable, already-claimed queue rows so the
+// normal observation transaction can be reused. A crash before completion is
+// recovered by the ordinary queue worker; a conflicting existing row is also
+// durable and is therefore safe to skip.
+func (s *Store) StageEntitySweepResults(
+	ctx context.Context, results []*model.UserResult,
+) ([]model.Candidate, error) {
+	if len(results) == 0 {
+		return nil, nil
+	}
+	githubIDs := make([]int64, len(results))
+	nodeIDs := make([]string, len(results))
+	logins := make([]string, len(results))
+	for index, result := range results {
+		if result == nil || result.GitHubID <= 0 || result.NodeID == "" ||
+			result.Login == "" || result.CreatedAt.IsZero() {
+			return nil, fmt.Errorf("invalid federation result at index %d", index)
+		}
+		githubIDs[index], nodeIDs[index], logins[index] =
+			result.GitHubID, result.NodeID, result.Login
+	}
+	rows, err := s.Pool.Query(ctx, `
+		INSERT INTO account_queue (
+		  source, github_id, node_id, login, status, attempts, claimed_at,
+		  lease_expires_at, claim_token, first_attempted_at
+		)
+		SELECT 'federation', github_id, node_id, login, 'running', 1, now(),
+		       now()+interval '2 hours', gen_random_uuid(), now()
+		FROM unnest($1::bigint[], $2::text[], $3::text[])
+		  AS input(github_id, node_id, login)
+		ON CONFLICT DO NOTHING
+		RETURNING id, run_id, source, github_id, node_id, login, scan_id::text,
+		          attempts, claim_token::text, coverage_generation_id,
+		          coverage_partition_id
+	`, githubIDs, nodeIDs, logins)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]model.Candidate, 0, len(results))
+	for rows.Next() {
+		var job model.Candidate
+		if err := rows.Scan(
+			&job.QueueID, &job.RunID, &job.Source, &job.GitHubID,
+			&job.NodeID, &job.Login, &job.ScanID, &job.Attempts,
+			&job.ClaimToken, &job.GenerationID, &job.PartitionID,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (s *Store) ExistingOwnerIDs(
+	ctx context.Context, githubIDs []int64,
+) (map[int64]bool, error) {
+	result := make(map[int64]bool)
+	if len(githubIDs) == 0 {
+		return result, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT github_id FROM github_owners WHERE github_id=ANY($1)
+	`, githubIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var githubID int64
+		if err := rows.Scan(&githubID); err != nil {
+			return nil, err
+		}
+		result[githubID] = true
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) AdvanceEntitySweepShard(
+	ctx context.Context,
+	shard EntitySweepShard,
+	expectedStart, nextID int64,
+	nextBatchSize int,
+	resolvedUsers, keyOwners, keysObserved int,
+) error {
+	if nextID <= expectedStart || nextID > shard.UpperID+1 {
+		return fmt.Errorf(
+			"invalid federation checkpoint %d..%d for shard upper %d",
+			expectedStart, nextID, shard.UpperID,
+		)
+	}
+	nextBatchSize = min(max(nextBatchSize, 25), 250)
+	status := "running"
+	if nextID == shard.UpperID+1 {
+		status = "completed"
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
+		UPDATE entity_sweep_shards
+		SET next_id=$4, status=$5, batch_size=$6, requests=requests+1,
+		    resolved_users=resolved_users+$7, key_owners=key_owners+$8,
+		    keys_observed=keys_observed+$9, last_success_at=now(),
+		    lease_expires_at=CASE WHEN $5='running' THEN now()+interval '2 hours' ELSE NULL END,
+		    claim_token=CASE WHEN $5='running' THEN claim_token ELSE NULL END,
+		    claimed_at=CASE WHEN $5='running' THEN claimed_at ELSE NULL END,
+		    completed_at=CASE WHEN $5='completed' THEN now() ELSE completed_at END
+		WHERE id=$1 AND claim_token::text=$2 AND status='running' AND next_id=$3
+	`, shard.ID, shard.ClaimToken, expectedStart, nextID, status, nextBatchSize,
+		resolvedUsers, keyOwners, keysObserved)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("stale federation sweep shard checkpoint")
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE entity_sweep_runs
+		SET requests=requests+1, resolved_users=resolved_users+$2,
+		    key_owners=key_owners+$3, keys_observed=keys_observed+$4,
+		    last_progress_at=now(),
+		    status=CASE WHEN NOT EXISTS (
+		      SELECT 1 FROM entity_sweep_shards
+		      WHERE run_id=$1 AND status <> 'completed'
+		    ) THEN 'completed' ELSE status END,
+		    completed_at=CASE WHEN NOT EXISTS (
+		      SELECT 1 FROM entity_sweep_shards
+		      WHERE run_id=$1 AND status <> 'completed'
+		    ) THEN now() ELSE completed_at END
+		WHERE id=$1
+	`, shard.RunID, resolvedUsers, keyOwners, keysObserved); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) RequeueEntitySweepShard(
+	ctx context.Context, shard EntitySweepShard, cause error, batchSize int,
+) error {
+	batchSize = min(max(batchSize, 25), 250)
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE entity_sweep_shards
+		SET status='retry', batch_size=$3, claimed_at=NULL, claim_token=NULL,
+		    lease_expires_at=NULL, last_error=$4, last_error_at=now()
+		WHERE id=$1 AND claim_token::text=$2 AND status='running'
+	`, shard.ID, shard.ClaimToken, batchSize, cause.Error())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("stale federation sweep shard retry")
+	}
+	return nil
+}
+
 func (s *Store) QueueDepth(ctx context.Context) (int, error) {
 	var count int
 	err := s.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM account_queue`).Scan(&count)
@@ -1741,16 +2065,16 @@ func (s *Store) ClaimScheduledAccounts(
 	// queue when the preferred class is empty, while equality can walk the
 	// existing status/source index and stop after the requested batch.
 	sourceOrder := []string{
-		"anomaly", "reconcile", "global", "tail", "onboarding", "priority",
+		"anomaly", "federation", "reconcile", "global", "tail", "onboarding", "priority",
 	}
 	switch preferred {
 	case "live":
 		sourceOrder = []string{
-			"anomaly", "tail", "onboarding", "reconcile", "global", "priority",
+			"anomaly", "federation", "tail", "onboarding", "reconcile", "global", "priority",
 		}
 	case "owner":
 		sourceOrder = []string{
-			"anomaly", "priority", "reconcile", "global", "tail", "onboarding",
+			"anomaly", "federation", "priority", "reconcile", "global", "tail", "onboarding",
 		}
 	}
 	tx, err := s.Pool.Begin(ctx)
@@ -2872,8 +3196,17 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (int64, error) {
 		    last_error='claim lease expired', last_error_at=now()
 		  WHERE status='running' AND lease_expires_at < now()
 		  RETURNING 1
+		), entity_sweeps AS (
+		  UPDATE entity_sweep_shards SET
+		    status='retry', claimed_at=NULL, claim_token=NULL,
+		    lease_expires_at=NULL,
+		    last_error='claim lease expired', last_error_at=now()
+		  WHERE status='running' AND lease_expires_at < now()
+		  RETURNING 1
 		)
-		SELECT (SELECT COUNT(*) FROM accounts) + (SELECT COUNT(*) FROM overflow)
+		SELECT (SELECT COUNT(*) FROM accounts) +
+		       (SELECT COUNT(*) FROM overflow) +
+		       (SELECT COUNT(*) FROM entity_sweeps)
 	`).Scan(&count)
 	if err != nil {
 		return 0, err
@@ -3866,9 +4199,107 @@ func (s *Store) ListIndexedUsers(
 	return users, keyRows.Err()
 }
 
+func (s *Store) EntitySweepStatus(ctx context.Context) (map[string]any, error) {
+	run, err := scanEntitySweepRun(s.Pool.QueryRow(ctx, `
+		SELECT id, kind, lower_id, upper_id, status, batch_size, requests,
+		       resolved_users, key_owners, keys_observed, started_at,
+		       last_progress_at, completed_at
+		FROM entity_sweep_runs
+		ORDER BY (status='running') DESC, id DESC LIMIT 1
+	`))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return map[string]any{
+			"status": "waiting_for_highwater", "enabled": true,
+			"complete": false, "durable_checkpoint": true,
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var processedIDs, remainingIDs, contiguousCheckpoint int64
+	var shardCount, completedShards, retryShards int
+	var lastError *string
+	var lastErrorAt *time.Time
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT
+		  COALESCE(SUM(next_id-lower_id), 0),
+		  COALESCE(SUM(upper_id-next_id+1), 0),
+		  COUNT(*),
+		  COUNT(*) FILTER (WHERE status='completed'),
+		  COUNT(*) FILTER (WHERE status='retry'),
+		  COALESCE((
+		    SELECT next_id-1 FROM entity_sweep_shards
+		    WHERE run_id=$1 AND status <> 'completed'
+		    ORDER BY lower_id LIMIT 1
+		  ), $2),
+		  (SELECT last_error FROM entity_sweep_shards
+		   WHERE run_id=$1 AND last_error IS NOT NULL
+		   ORDER BY last_error_at DESC NULLS LAST LIMIT 1),
+		  (SELECT last_error_at FROM entity_sweep_shards
+		   WHERE run_id=$1 AND last_error IS NOT NULL
+		   ORDER BY last_error_at DESC NULLS LAST LIMIT 1)
+		FROM entity_sweep_shards WHERE run_id=$1
+	`, run.ID, run.UpperID).Scan(
+		&processedIDs, &remainingIDs, &shardCount, &completedShards, &retryShards,
+		&contiguousCheckpoint, &lastError, &lastErrorAt,
+	); err != nil {
+		return nil, err
+	}
+	var queueJobs, overflowJobs int64
+	if err := s.Pool.QueryRow(ctx, `
+		SELECT (SELECT COUNT(*) FROM account_queue WHERE source='federation'),
+		       (SELECT COUNT(*) FROM overflow_queue WHERE source='federation')
+	`).Scan(&queueJobs, &overflowJobs); err != nil {
+		return nil, err
+	}
+	totalIDs := run.UpperID - run.LowerID + 1
+	percentage := 0.0
+	if totalIDs > 0 {
+		percentage = 100 * float64(processedIDs) / float64(totalIDs)
+	}
+	status := run.Status
+	settled := run.Status == "completed" && queueJobs == 0 && overflowJobs == 0
+	if run.Status == "completed" && !settled {
+		status = "settling_overflow"
+	}
+	result := map[string]any{
+		"enabled": true, "run_id": run.ID, "kind": run.Kind,
+		"status": status, "complete": settled,
+		"lower_id": run.LowerID, "cutoff_id": run.UpperID,
+		"contiguous_checkpoint_id": contiguousCheckpoint,
+		"processed_id_positions":   processedIDs, "remaining_id_positions": remainingIDs,
+		"percentage": percentage, "batch_size": run.BatchSize,
+		"requests": run.Requests, "resolved_users": run.ResolvedUsers,
+		"key_owners": run.KeyOwners, "keys_observed": run.KeysObserved,
+		"shards": shardCount, "completed_shards": completedShards,
+		"retrying_shards": retryShards, "queued_results": queueJobs,
+		"overflow_jobs": overflowJobs, "started_at": run.StartedAt,
+		"last_progress_at": run.LastProgressAt, "completed_at": run.CompletedAt,
+		"last_error": lastError, "last_error_at": lastErrorAt,
+		"durable_checkpoint": true,
+		"coverage":           "every numeric GitHub actor ID in the inclusive run range",
+	}
+	if run.LastProgressAt != nil && run.LastProgressAt.After(run.StartedAt) && processedIDs > 0 {
+		elapsedHours := run.LastProgressAt.Sub(run.StartedAt).Hours()
+		if elapsedHours > 0 {
+			rate := float64(processedIDs) / elapsedHours
+			remainingHours := float64(remainingIDs) / rate
+			result["rate_ids_per_hour"] = rate
+			result["remaining_hours"] = remainingHours
+			result["estimated_finish"] = time.Now().Add(time.Duration(remainingHours * float64(time.Hour)))
+			result["estimate_preliminary"] = elapsedHours < 1
+		}
+	}
+	return result, nil
+}
+
 func (s *Store) Status(ctx context.Context) (map[string]any, error) {
+	entitySweep, err := s.EntitySweepStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var owners, keys, associations, currentAssociations, queued, overflow int64
-	err := s.Pool.QueryRow(ctx, `
+	err = s.Pool.QueryRow(ctx, `
 		SELECT
 		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'github_owners'), 0),
 		  COALESCE(MAX(n_live_tup) FILTER (WHERE relname = 'ssh_keys'), 0),
@@ -4750,6 +5181,7 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		negativeCoverage = "verified_to_coverage_cutoff"
 	}
 	return map[string]any{
+		"federation_sweep": entitySweep,
 		"count_accuracy": map[string]any{
 			"index_and_queue_totals": "PostgreSQL live-row estimates; refreshed by autovacuum/analyze",
 			"active_and_retry_jobs":  "exact",

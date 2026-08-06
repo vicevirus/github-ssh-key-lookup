@@ -37,6 +37,25 @@ query UsersAndKeys($ids: [ID!]!) {
   rateLimit { cost limit remaining used resetAt }
 }`
 
+const usersByDatabaseIDQuery = `
+query UsersByDatabaseID($representations: [_Any!]!) {
+  _entities(representations: $representations) {
+    __typename
+    ... on User {
+      id
+      databaseId
+      login
+      createdAt
+      publicKeys(first: 100) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { key fingerprint }
+      }
+    }
+  }
+  rateLimit { cost limit remaining used resetAt }
+}`
+
 const moreKeysQuery = `
 query MoreKeys($id: ID!, $after: String!) {
   node(id: $id) {
@@ -174,6 +193,22 @@ func (e *RateLimitError) Error() string {
 type AuthenticationError struct {
 	Status int
 	Body   string
+}
+
+type HTTPError struct {
+	Operation string
+	Status    int
+	Body      string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("GitHub %s HTTP %d: %s", e.Operation, e.Status, e.Body)
+}
+
+func IsGatewayTimeout(err error) bool {
+	var request *HTTPError
+	return errors.As(err, &request) &&
+		(request.Status == http.StatusBadGateway || request.Status == http.StatusGatewayTimeout)
 }
 
 func (e *AuthenticationError) Error() string {
@@ -505,6 +540,98 @@ func (c *Client) FetchUsers(ctx context.Context, ids []string) (UsersAndKeys, er
 	}, nil
 }
 
+// FetchUsersByDatabaseIDs uses GitHub's federation entity resolver to resolve
+// a dense numeric account-ID range and fetch the first 100 SSH keys in the
+// same one-point query. Live probes established 250 as the largest operational
+// batch worth accepting; production callers use a lower adaptive target to
+// stay clear of GitHub's gateway timeout.
+func (c *Client) FetchUsersByDatabaseIDs(
+	ctx context.Context, databaseIDs []int64,
+) (UsersAndKeys, error) {
+	if len(databaseIDs) == 0 {
+		return UsersAndKeys{}, errors.New("GraphQL federation batch is empty")
+	}
+	if len(databaseIDs) > 250 {
+		return UsersAndKeys{}, fmt.Errorf(
+			"GraphQL federation batch exceeds verified operational limit: %d > 250",
+			len(databaseIDs),
+		)
+	}
+	representations := make([]map[string]any, len(databaseIDs))
+	for index, databaseID := range databaseIDs {
+		if databaseID <= 0 {
+			return UsersAndKeys{}, fmt.Errorf(
+				"invalid GitHub database ID at index %d: %d", index, databaseID,
+			)
+		}
+		// A string avoids JSON number precision issues if GitHub's allocator ever
+		// grows beyond JavaScript's exact integer range.
+		representations[index] = map[string]any{
+			"__typename": "User",
+			"databaseId": strconv.FormatInt(databaseID, 10),
+		}
+	}
+	var envelope struct {
+		Data struct {
+			Entities  []*GraphQLUser `json:"_entities"`
+			RateLimit graphQLRate    `json:"rateLimit"`
+		} `json:"data"`
+		Errors []graphQLError `json:"errors"`
+	}
+	elapsed, err := c.graphql(
+		ctx, usersByDatabaseIDQuery,
+		map[string]any{"representations": representations}, &envelope,
+	)
+	if err != nil {
+		return UsersAndKeys{}, err
+	}
+	if limited := graphQLRateError(envelope.Errors, envelope.Data.RateLimit); limited != nil {
+		return UsersAndKeys{}, limited
+	}
+	if len(envelope.Data.Entities) != len(databaseIDs) {
+		return UsersAndKeys{}, fmt.Errorf(
+			"GitHub returned %d federation entities for %d database IDs",
+			len(envelope.Data.Entities), len(databaseIDs),
+		)
+	}
+	notFound, err := federationNotFoundPositions(envelope.Errors, len(databaseIDs))
+	if err != nil {
+		return UsersAndKeys{}, err
+	}
+	for index, entity := range envelope.Data.Entities {
+		if entity == nil && !notFound[index] {
+			return UsersAndKeys{}, fmt.Errorf(
+				"GitHub federation entity %d was null without an indexed NOT_FOUND error",
+				index,
+			)
+		}
+		if entity != nil && notFound[index] {
+			return UsersAndKeys{}, fmt.Errorf(
+				"GitHub federation entity %d was returned with NOT_FOUND", index,
+			)
+		}
+	}
+	return UsersAndKeys{
+		Nodes: envelope.Data.Entities, Rate: envelope.Data.RateLimit.model(), Elapsed: elapsed,
+	}, nil
+}
+
+func federationNotFoundPositions(errors []graphQLError, size int) (map[int]bool, error) {
+	positions := make(map[int]bool, len(errors))
+	for _, item := range errors {
+		if item.Type != "NOT_FOUND" || len(item.Path) < 2 || item.Path[0] != "_entities" {
+			return nil, fmt.Errorf("GitHub GraphQL federation errors: %v", errors)
+		}
+		value, ok := item.Path[1].(float64)
+		index := int(value)
+		if !ok || value != float64(index) || index < 0 || index >= size {
+			return nil, fmt.Errorf("invalid federation NOT_FOUND path: %v", item.Path)
+		}
+		positions[index] = true
+	}
+	return positions, nil
+}
+
 // FetchUsersByResources resolves profile URLs through GitHub's documented
 // UniformResourceLocatable query. This is deliberately separate from
 // FetchUsers: GitHub can resolve a public profile URL even when both node(id:)
@@ -666,7 +793,9 @@ func (c *Client) graphqlRequest(
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return elapsed, fmt.Errorf("GitHub GraphQL HTTP %d: %s", resp.StatusCode, body)
+		return elapsed, &HTTPError{
+			Operation: "GraphQL", Status: resp.StatusCode, Body: string(body),
+		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
 		return elapsed, fmt.Errorf("decode GitHub GraphQL response: %w", err)
@@ -769,6 +898,7 @@ func replayRequest(req *http.Request) (*http.Request, error) {
 type graphQLError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	Path    []any  `json:"path"`
 }
 
 func (e graphQLError) String() string {

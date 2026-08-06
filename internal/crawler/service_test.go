@@ -31,6 +31,54 @@ func TestNormalizeUsersPreservesNullNode(t *testing.T) {
 	}
 }
 
+func TestNormalizeEntityUsersAcceptsLegacyAndModernUsersAndFiltersOtherActors(t *testing.T) {
+	created := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	raw := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL1LeQQBsiMach2TP93bSThTouh8aV9DOZABSw3qzwfb"
+	parsed, err := sshkey.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := []*githubapi.GraphQLUser{
+		{
+			TypeName: "User", ID: "MDQ6VXNlcjE=", DatabaseID: 1,
+			Login: "legacy", CreatedAt: created,
+			PublicKeys: githubapi.KeyConnection{},
+		},
+		{
+			TypeName: "User", ID: "U_modern", DatabaseID: 2,
+			Login: "modern", CreatedAt: created,
+			PublicKeys: githubapi.KeyConnection{
+				TotalCount: 1,
+				Nodes:      []githubapi.GraphQLKey{{Key: raw, Fingerprint: parsed.Text}},
+			},
+		},
+		{TypeName: "User", ID: "BOT_other", DatabaseID: 3},
+		nil,
+	}
+	results, resolved, owners, keys, err := normalizeEntityUsers(
+		[]int64{1, 2, 3, 4}, nodes,
+	)
+	if err != nil || len(results) != 2 || resolved != 2 || owners != 1 || keys != 1 {
+		t.Fatalf(
+			"unexpected normalized federation result: results=%#v resolved=%d owners=%d keys=%d err=%v",
+			results, resolved, owners, keys, err,
+		)
+	}
+}
+
+func TestNormalizeEntityUsersRejectsPositionMismatch(t *testing.T) {
+	created := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, _, _, _, err := normalizeEntityUsers(
+		[]int64{1}, []*githubapi.GraphQLUser{{
+			TypeName: "User", ID: "U_wrong", DatabaseID: 2,
+			Login: "wrong", CreatedAt: created,
+		}},
+	)
+	if err == nil {
+		t.Fatal("accepted reordered federation entity")
+	}
+}
+
 func TestPlanEnumerationPageRequiresProvenPaginationContinuity(t *testing.T) {
 	shard := store.EnumerationShard{
 		NextSinceID: 100, NextURL: "https://api.github.test/users?since=100&per_page=100",

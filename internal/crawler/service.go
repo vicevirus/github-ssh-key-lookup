@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,9 @@ import (
 
 type Config struct {
 	Workers               int
+	FederationWorkers     int
+	FederationBatchSize   int
+	FederationRecrawl     time.Duration
 	RESTFallbackWorkers   int
 	QueueMax              int
 	RESTPerHour           int
@@ -44,7 +48,10 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Workers:             4,
+		Workers:             1,
+		FederationWorkers:   5,
+		FederationBatchSize: 200,
+		FederationRecrawl:   30 * 24 * time.Hour,
 		RESTFallbackWorkers: 1,
 		QueueMax:            10_000,
 		RESTPerHour:         4_700,
@@ -100,6 +107,16 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	if config.Workers > 10 {
 		config.Workers = 10
 	}
+	if config.FederationWorkers < 1 {
+		config.FederationWorkers = 1
+	}
+	if config.FederationWorkers > 20 {
+		config.FederationWorkers = 20
+	}
+	config.FederationBatchSize = min(max(config.FederationBatchSize, 25), 250)
+	if config.FederationRecrawl <= 0 {
+		config.FederationRecrawl = 30 * 24 * time.Hour
+	}
 	if config.RESTFallbackWorkers < 1 {
 		config.RESTFallbackWorkers = 1
 	}
@@ -150,6 +167,9 @@ func (s *Service) Run(ctx context.Context) error {
 		"owner_refresh_schedule":  durationList(s.Config.OwnerSchedule),
 		"zero_key_retry_ages":     durationList(s.Config.ZeroKeyRecheckAges),
 		"enumeration_workers":     strconv.Itoa(s.Config.Workers),
+		"federation_workers":      strconv.Itoa(s.Config.FederationWorkers),
+		"federation_batch_size":   strconv.Itoa(s.Config.FederationBatchSize),
+		"federation_recrawl":      s.Config.FederationRecrawl.String(),
 		"rest_fallback_workers":   strconv.Itoa(s.Config.RESTFallbackWorkers),
 	} {
 		if err := s.Store.SetState(ctx, key, value); err != nil {
@@ -171,6 +191,10 @@ func (s *Service) Run(ctx context.Context) error {
 	for worker := 0; worker < s.Config.Workers; worker++ {
 		workerID := worker
 		group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
+	}
+	for worker := 0; worker < s.Config.FederationWorkers; worker++ {
+		workerID := worker
+		group.Go(func() error { return s.entitySweepWorker(groupCtx, workerID) })
 	}
 	for worker := 0; worker < s.Config.RESTFallbackWorkers; worker++ {
 		workerID := worker
@@ -194,6 +218,244 @@ func (s *Service) Run(ctx context.Context) error {
 	group.Go(func() error { return s.coverageAudit(groupCtx) })
 	group.Go(func() error { return s.monitorRuns(groupCtx) })
 	return group.Wait()
+}
+
+func (s *Service) entitySweepWorker(ctx context.Context, workerID int) error {
+	worker := fmt.Sprintf("federation-%d", workerID)
+	role := "dense GraphQL federation ID sweep"
+	s.workerActivity(ctx, worker, role, "starting", "waiting for numeric ID sweep")
+	defer s.Store.StopWorker(context.Background(), worker, role)
+	successesAtCurrentSize := 0
+	for ctx.Err() == nil {
+		if _, err := s.Store.EnsureEntitySweepRun(
+			ctx, s.Config.FederationWorkers, s.Config.FederationBatchSize,
+			s.Config.FederationRecrawl,
+		); errors.Is(err, pgx.ErrNoRows) {
+			s.workerActivity(ctx, worker, role, "waiting", "numeric ID sweep is caught up")
+			if err := sleep(ctx, 5*time.Second); err != nil {
+				return nil
+			}
+			continue
+		} else if err != nil {
+			return err
+		}
+		shard, err := s.Store.ClaimEntitySweepShard(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := sleep(ctx, 500*time.Millisecond); err != nil {
+				return nil
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for ctx.Err() == nil && shard.NextID <= shard.UpperID {
+			batchSize := min(shard.BatchSize, int(shard.UpperID-shard.NextID+1))
+			databaseIDs := make([]int64, batchSize)
+			for index := range databaseIDs {
+				databaseIDs[index] = shard.NextID + int64(index)
+			}
+			s.workerActivity(ctx, worker, role, "running",
+				fmt.Sprintf("resolving numeric IDs %d..%d", databaseIDs[0], databaseIDs[len(databaseIDs)-1]))
+			if err := s.graphql.Wait(ctx); err != nil {
+				_ = s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, shard.BatchSize,
+				)
+				return nil
+			}
+			response, err := s.GitHub.FetchUsersByDatabaseIDs(ctx, databaseIDs)
+			if err != nil {
+				s.workerError(ctx, worker, role, "federation batch failed", err)
+				s.handleRateError(ctx, err, s.graphql, "graphql")
+				nextBatchSize := shard.BatchSize
+				if githubapi.IsGatewayTimeout(err) {
+					nextBatchSize = max(25, shard.BatchSize/2)
+					successesAtCurrentSize = 0
+				}
+				if retryErr := s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, nextBatchSize,
+				); retryErr != nil {
+					return retryErr
+				}
+				if isAuthenticationError(err) {
+					return err
+				}
+				_ = sleep(ctx, retryDelay(err, shard.Attempts))
+				break
+			}
+			s.graphql.Observe(response.Rate)
+			s.graphql.ExtraCost(response.Rate.Cost)
+			results, resolvedUsers, keyOwners, keyCount, err :=
+				normalizeEntityUsers(databaseIDs, response.Nodes)
+			if err != nil {
+				if retryErr := s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, max(25, shard.BatchSize/2),
+				); retryErr != nil {
+					return retryErr
+				}
+				s.workerError(ctx, worker, role, "invalid federation response", err)
+				break
+			}
+			resultIDs := make([]int64, len(results))
+			for index := range results {
+				resultIDs[index] = results[index].GitHubID
+			}
+			existingOwners, err := s.Store.ExistingOwnerIDs(ctx, resultIDs)
+			if err != nil {
+				_ = s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, shard.BatchSize,
+				)
+				return err
+			}
+			selected := make([]*model.UserResult, 0, keyOwners+len(existingOwners))
+			resultByID := make(map[int64]*model.UserResult)
+			for _, result := range results {
+				if result.TotalKeyCount == 0 && !existingOwners[result.GitHubID] {
+					continue
+				}
+				selected = append(selected, result)
+				resultByID[result.GitHubID] = result
+			}
+			jobs, err := s.Store.StageEntitySweepResults(ctx, selected)
+			if err != nil {
+				_ = s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, shard.BatchSize,
+				)
+				return err
+			}
+			stagedResults := make([]*model.UserResult, 0, len(jobs))
+			for _, job := range jobs {
+				result := resultByID[job.GitHubID]
+				if result == nil {
+					return fmt.Errorf("staged federation account %d has no result", job.GitHubID)
+				}
+				stagedResults = append(stagedResults, result)
+			}
+			if err := s.Store.CompleteAccountsScheduled(
+				ctx, jobs, stagedResults,
+				s.Config.OwnerSchedule, s.Config.ZeroKeyRecheckAges,
+			); err != nil {
+				_ = s.Store.RequeueAccountsAfter(
+					context.Background(), jobs, err, retryDelay(err, 1),
+				)
+				_ = s.Store.RequeueEntitySweepShard(
+					context.Background(), shard, err, shard.BatchSize,
+				)
+				return fmt.Errorf("commit federation results: %w", err)
+			}
+			nextBatchSize := shard.BatchSize
+			switch {
+			case response.Elapsed > 8*time.Second:
+				nextBatchSize = max(25, shard.BatchSize-25)
+				successesAtCurrentSize = 0
+			case response.Elapsed < 7*time.Second && shard.BatchSize < 250:
+				successesAtCurrentSize++
+				if successesAtCurrentSize >= 20 {
+					nextBatchSize = min(250, shard.BatchSize+10)
+					successesAtCurrentSize = 0
+				}
+			default:
+				successesAtCurrentSize = 0
+			}
+			nextID := shard.NextID + int64(len(databaseIDs))
+			if err := s.Store.AdvanceEntitySweepShard(
+				ctx, shard, shard.NextID, nextID, nextBatchSize,
+				resolvedUsers, keyOwners, keyCount,
+			); err != nil {
+				return err
+			}
+			s.workerRequest(
+				ctx, worker, role, "indexed dense federation batch", response.Rate,
+				len(databaseIDs), keyCount,
+			)
+			s.Logger.Info("indexed federation ID batch",
+				"worker", workerID, "first_id", databaseIDs[0],
+				"last_id", databaseIDs[len(databaseIDs)-1],
+				"resolved_users", resolvedUsers, "key_owners", keyOwners,
+				"keys", keyCount, "batch_size", len(databaseIDs),
+				"next_batch_size", nextBatchSize, "cost", response.Rate.Cost,
+				"remaining", response.Rate.Remaining, "latency", response.Elapsed)
+			shard.NextID, shard.BatchSize = nextID, nextBatchSize
+		}
+	}
+	return nil
+}
+
+func normalizeEntityUsers(
+	databaseIDs []int64, nodes []*githubapi.GraphQLUser,
+) ([]*model.UserResult, int, int, int, error) {
+	if len(databaseIDs) != len(nodes) {
+		return nil, 0, 0, 0, errors.New("federation response cardinality mismatch")
+	}
+	results := make([]*model.UserResult, 0, len(nodes))
+	resolvedUsers, keyOwners, keyCount := 0, 0, 0
+	for index, user := range nodes {
+		if user == nil {
+			continue
+		}
+		if user.DatabaseID != databaseIDs[index] {
+			return nil, 0, 0, 0, fmt.Errorf(
+				"federation identity mismatch at index %d: expected %d received %d",
+				index, databaseIDs[index], user.DatabaseID,
+			)
+		}
+		if user.ID == "" {
+			return nil, 0, 0, 0, fmt.Errorf(
+				"incomplete federation identity for database ID %d", user.DatabaseID,
+			)
+		}
+		isUser := isGitHubUserNodeID(user.ID)
+		if !isUser && user.PublicKeys.TotalCount == 0 {
+			// Federation accepts a User representation for other actor-table rows.
+			// Their real node-ID prefix is retained, so zero-key non-users are
+			// filtered without spending a REST verification request.
+			continue
+		}
+		if user.Login == "" || user.CreatedAt.IsZero() {
+			return nil, 0, 0, 0, fmt.Errorf(
+				"incomplete federation identity for database ID %d", user.DatabaseID,
+			)
+		}
+		keys, err := normalizeKeys(user.PublicKeys.Nodes)
+		if err != nil {
+			return nil, 0, 0, 0, fmt.Errorf(
+				"federation account %d key snapshot: %w", user.DatabaseID, err,
+			)
+		}
+		if user.PublicKeys.TotalCount < len(keys) ||
+			(!user.PublicKeys.PageInfo.HasNextPage && user.PublicKeys.TotalCount != len(keys)) ||
+			(user.PublicKeys.PageInfo.HasNextPage &&
+				(user.PublicKeys.TotalCount <= len(keys) || user.PublicKeys.PageInfo.EndCursor == "")) {
+			return nil, 0, 0, 0, fmt.Errorf(
+				"federation account %d inconsistent key connection: total=%d nodes=%d has_more=%t",
+				user.DatabaseID, user.PublicKeys.TotalCount, len(keys),
+				user.PublicKeys.PageInfo.HasNextPage,
+			)
+		}
+		if isUser {
+			resolvedUsers++
+		}
+		if user.PublicKeys.TotalCount > 0 {
+			keyOwners++
+		}
+		keyCount += len(keys)
+		results = append(results, &model.UserResult{
+			NodeID: user.ID, GitHubID: user.DatabaseID, Login: user.Login,
+			CreatedAt: user.CreatedAt, Keys: keys,
+			HasMoreKeys:   user.PublicKeys.PageInfo.HasNextPage,
+			NextCursor:    user.PublicKeys.PageInfo.EndCursor,
+			TotalKeyCount: user.PublicKeys.TotalCount,
+		})
+	}
+	return results, resolvedUsers, keyOwners, keyCount, nil
+}
+
+func isGitHubUserNodeID(nodeID string) bool {
+	if strings.HasPrefix(nodeID, "U_") {
+		return true
+	}
+	decoded, err := base64.StdEncoding.DecodeString(nodeID)
+	return err == nil && strings.Contains(string(decoded), ":User")
 }
 
 func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error {

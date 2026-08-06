@@ -109,6 +109,36 @@ func TestCompactStatusSnapshotOmitsInternalDetails(t *testing.T) {
 	}
 }
 
+func TestCompactStatusPrefersFederationSweepETA(t *testing.T) {
+	legacyFinish := time.Now().Add(30 * 24 * time.Hour)
+	fastFinish := time.Now().Add(9 * 24 * time.Hour)
+	snapshot := map[string]any{
+		"index": map[string]int64{"owners": 1, "keys": 1},
+		"progress": map[string]any{
+			"estimated_completion": map[string]any{
+				"fast_scan_finish_early": legacyFinish,
+				"fast_scan_finish_late":  legacyFinish,
+				"estimated_finish_early": legacyFinish,
+				"basis":                  "legacy REST",
+			},
+		},
+		"federation_sweep": map[string]any{
+			"status": "running", "estimated_finish": fastFinish,
+			"processed_id_positions": int64(10_000), "estimate_preliminary": false,
+		},
+		"crawler":  map[string]any{"online": true},
+		"coverage": map[string]any{}, "recovery": map[string]any{},
+		"passes": map[string]any{}, "lookup": map[string]any{"usable": true},
+	}
+	result := compactStatusSnapshot(snapshot)
+	progress := result["progress"].(map[string]any)
+	if progress["estimated_finish_early"] != fastFinish ||
+		progress["estimate_basis"] != "dense GraphQL federation ID sweep measured throughput" ||
+		progress["fast_sweep"] == nil {
+		t.Fatalf("federation ETA was not preferred: %#v", progress)
+	}
+}
+
 func TestParsePaginationDefaultsAndBounds(t *testing.T) {
 	page, err := parsePagination(url.Values{})
 	if err != nil {

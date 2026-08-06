@@ -126,6 +126,15 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	}
 	config := crawler.DefaultConfig()
 	config.Workers = envInt("GRAPHQL_WORKERS", config.Workers) * credentialCount
+	config.FederationWorkers = envInt(
+		"FEDERATION_WORKERS", config.FederationWorkers,
+	) * credentialCount
+	config.FederationBatchSize = envInt(
+		"FEDERATION_BATCH_SIZE", config.FederationBatchSize,
+	)
+	config.FederationRecrawl = envDuration(
+		"FEDERATION_RECRAWL_INTERVAL", config.FederationRecrawl,
+	)
 	config.RESTFallbackWorkers = envInt(
 		"REST_FALLBACK_WORKERS", config.RESTFallbackWorkers,
 	) * credentialCount

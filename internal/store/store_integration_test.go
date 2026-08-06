@@ -33,7 +33,8 @@ func integrationStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	_, err = database.Pool.Exec(ctx, `
-		TRUNCATE crawler_workers, overflow_queue, account_queue, zero_key_rechecks,
+		TRUNCATE entity_sweep_shards, entity_sweep_runs,
+		         crawler_workers, overflow_queue, account_queue, zero_key_rechecks,
 		         github_owner_keys, ssh_keys, github_owner_logins, github_owners,
 		         crawl_runs, runtime_state RESTART IDENTITY CASCADE
 	`)
@@ -43,6 +44,74 @@ func integrationStore(t *testing.T) *Store {
 	}
 	t.Cleanup(database.Close)
 	return database
+}
+
+func TestEntitySweepCheckpointAndObservationAreDurable(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	if err := database.SetState(ctx, "tail_highwater", "1000"); err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.EnsureEntitySweepRun(ctx, 2, 200, 30*24*time.Hour)
+	if err != nil || run.Kind != "initial" || run.LowerID != 1 || run.UpperID != 1000 {
+		t.Fatalf("unexpected sweep run: %#v err=%v", run, err)
+	}
+	again, err := database.EnsureEntitySweepRun(ctx, 2, 200, 30*24*time.Hour)
+	if err != nil || again.ID != run.ID {
+		t.Fatalf("active sweep was duplicated: %#v err=%v", again, err)
+	}
+	shard, err := database.ClaimEntitySweepShard(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := parsedTestKey(t, 11)
+	result := &model.UserResult{
+		NodeID: "U_1", GitHubID: shard.NextID, Login: "federated",
+		CreatedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		Keys:      []model.PublicKey{key}, TotalKeyCount: 1,
+	}
+	jobs, err := database.StageEntitySweepResults(ctx, []*model.UserResult{result})
+	if err != nil || len(jobs) != 1 || jobs[0].Source != "federation" {
+		t.Fatalf("federation result was not durably staged: %#v err=%v", jobs, err)
+	}
+	if err := database.CompleteAccountsScheduled(
+		ctx, jobs, []*model.UserResult{result}, []time.Duration{24 * time.Hour}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	nextID := min(shard.NextID+int64(shard.BatchSize), shard.UpperID+1)
+	if err := database.AdvanceEntitySweepShard(
+		ctx, shard, shard.NextID, nextID, 210, 1, 1, 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+	status, err := database.EntitySweepStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["processed_id_positions"] != nextID-shard.LowerID ||
+		status["resolved_users"] != int64(1) || status["key_owners"] != int64(1) {
+		t.Fatalf("unexpected sweep status: %#v", status)
+	}
+	matches, err := database.Lookup(ctx, key.Text)
+	if err != nil || len(matches) != 1 || matches[0].Login != "federated" {
+		t.Fatalf("federation key was not indexed: %#v err=%v", matches, err)
+	}
+	recoverable, err := database.ClaimEntitySweepShard(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err = database.EntitySweepStatus(ctx)
+	if err != nil || status["retrying_shards"] != 1 {
+		t.Fatalf("running federation shard was not recovered: %#v err=%v", status, err)
+	}
+	reclaimed, err := database.ClaimEntitySweepShard(ctx)
+	if err != nil || reclaimed.ID != recoverable.ID || reclaimed.NextID != recoverable.NextID {
+		t.Fatalf("federation checkpoint did not resume exactly: %#v err=%v", reclaimed, err)
+	}
 }
 
 func parsedTestKey(t *testing.T, offset byte) model.PublicKey {

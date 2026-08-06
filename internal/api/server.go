@@ -175,7 +175,19 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	recovery := anyMap(snapshot["recovery"])
 	passes := anyMap(snapshot["passes"])
 	lookup := anyMap(snapshot["lookup"])
+	federation := anyMap(snapshot["federation_sweep"])
 	estimate := anyMap(progress["estimated_completion"])
+	fastFinishEarly := estimate["fast_scan_finish_early"]
+	fastFinishLate := estimate["fast_scan_finish_late"]
+	estimateBasis := estimate["basis"]
+	estimatePreliminary := estimate["rate_is_preliminary"]
+	if federation != nil && federation["status"] == "running" {
+		if finish := federation["estimated_finish"]; finish != nil {
+			fastFinishEarly, fastFinishLate = finish, finish
+			estimateBasis = "dense GraphQL federation ID sweep measured throughput"
+			estimatePreliminary = federation["estimate_preliminary"]
+		}
+	}
 
 	state := "offline"
 	if online, _ := crawler["online"].(bool); online {
@@ -204,6 +216,7 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"keys":   index["keys"],
 		},
 		"progress": map[string]any{
+			"fast_sweep":             federation,
 			"enumerated_users":       progress["enumerated_users"],
 			"attempted_users":        progress["attempted_users"],
 			"processed_users":        progress["processed_users"],
@@ -224,15 +237,15 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 			"attempt_rate_per_hour":       progress["rolling_1h_attempts_per_hour"],
 			"enumeration_users_per_hour":  progress["current_enumeration_users_per_hour"],
 			"enumeration_ids_per_request": estimate["enumeration_ids_per_request"],
-			"fast_scan_finish_early":      estimate["fast_scan_finish_early"],
-			"fast_scan_finish_late":       estimate["fast_scan_finish_late"],
-			"estimated_finish_early":      estimate["fast_scan_finish_early"],
-			"estimated_finish_late":       estimate["fast_scan_finish_late"],
+			"fast_scan_finish_early":      fastFinishEarly,
+			"fast_scan_finish_late":       fastFinishLate,
+			"estimated_finish_early":      fastFinishEarly,
+			"estimated_finish_late":       fastFinishLate,
 			"settled_finish_early":        estimate["estimated_finish_early"],
 			"settled_finish_late":         estimate["estimated_finish_late"],
-			"estimate_basis":              estimate["basis"],
-			"estimate_preliminary":        estimate["rate_is_preliminary"],
-			"fast_scan_scope":             "all discovered accounts receive one GraphQL key attempt; positive matches are usable",
+			"estimate_basis":              estimateBasis,
+			"estimate_preliminary":        estimatePreliminary,
+			"fast_scan_scope":             "every numeric GitHub actor ID through the federation cutoff receives a GraphQL SSH-key lookup",
 			"settled_scope":               "first pass: GraphQL-null accounts are URL-resource repaired in batches; only unresolved identities use REST",
 			"estimate_scope":              "first pass only; independently verified full coverage is reported under passes.second",
 		},

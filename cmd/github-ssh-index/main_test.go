@@ -18,7 +18,8 @@ func TestCrawlerServiceScalesPerCredentialSettings(t *testing.T) {
 	if service.GitHub.CredentialCount() != 2 {
 		t.Fatalf("credential count=%d, want 2", service.GitHub.CredentialCount())
 	}
-	if service.Config.Workers != 8 || service.Config.RESTPerHour != 9400 ||
+	if service.Config.Workers != 8 || service.Config.FederationWorkers != 10 ||
+		service.Config.RESTPerHour != 9400 ||
 		service.Config.GraphQLPerHour != 9400 || service.Config.SearchPerHour != 3000 {
 		t.Fatalf("settings were not scaled per credential: %#v", service.Config)
 	}

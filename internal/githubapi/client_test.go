@@ -106,6 +106,74 @@ func TestFetchUsersEnforcesVerifiedHundredIDLimitAndCost(t *testing.T) {
 	}
 }
 
+func TestFetchUsersByDatabaseIDsPreservesPositionsAndUsesStringIDs(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		var body struct {
+			Query     string `json:"query"`
+			Variables struct {
+				Representations []map[string]any `json:"representations"`
+			} `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(body.Query, "_entities") ||
+			len(body.Variables.Representations) != 3 ||
+			body.Variables.Representations[0]["databaseId"] != "170000009" ||
+			body.Variables.Representations[0]["__typename"] != "User" {
+			t.Fatalf("unexpected federation request: %#v", body)
+		}
+		_, _ = response.Write([]byte(`{
+          "data": {
+            "_entities": [
+              {"__typename":"User","id":"U_one","databaseId":170000009,"login":"one","createdAt":"2020-01-01T00:00:00Z","publicKeys":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}},
+              null,
+              {"__typename":"User","id":"U_three","databaseId":170000011,"login":"three","createdAt":"2020-01-01T00:00:00Z","publicKeys":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}
+            ],
+            "rateLimit":{"cost":1,"limit":5000,"remaining":4999,"used":1,"resetAt":"2026-08-06T08:00:00Z"}
+          },
+          "errors":[{"type":"NOT_FOUND","message":"missing","path":["_entities",1]}]
+        }`))
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.GraphQLURL = server.URL
+	client.HTTP = server.Client()
+	result, err := client.FetchUsersByDatabaseIDs(
+		context.Background(), []int64{170000009, 170000010, 170000011},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Nodes) != 3 || result.Nodes[0] == nil || result.Nodes[1] != nil ||
+		result.Nodes[2] == nil || result.Rate.Cost != 1 {
+		t.Fatalf("unexpected federation result: %#v", result)
+	}
+	if _, err := client.FetchUsersByDatabaseIDs(context.Background(), make([]int64, 251)); err == nil {
+		t.Fatal("accepted more than 250 federation representations")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("invalid batch reached server: calls=%d", calls.Load())
+	}
+}
+
+func TestFetchUsersByDatabaseIDsClassifiesGatewayTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = response.Write([]byte(`{"message":"timed out"}`))
+	}))
+	defer server.Close()
+	client := New("token", "test")
+	client.GraphQLURL = server.URL
+	client.HTTP = server.Client()
+	_, err := client.FetchUsersByDatabaseIDs(context.Background(), []int64{1})
+	if !IsGatewayTimeout(err) {
+		t.Fatalf("gateway timeout was not classified: %v", err)
+	}
+}
+
 func TestFetchUsersByResourcesBatchesAliasesAndRequestsCurrentNodeIDs(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
