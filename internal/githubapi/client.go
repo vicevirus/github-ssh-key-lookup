@@ -599,12 +599,6 @@ func (c *Client) FetchUsersByDatabaseIDs(
 		return UsersAndKeys{}, err
 	}
 	for index, entity := range envelope.Data.Entities {
-		if entity == nil && !notFound[index] {
-			return UsersAndKeys{}, fmt.Errorf(
-				"GitHub federation entity %d was null without an indexed NOT_FOUND error",
-				index,
-			)
-		}
 		if entity != nil && notFound[index] {
 			return UsersAndKeys{}, fmt.Errorf(
 				"GitHub federation entity %d was returned with NOT_FOUND", index,
