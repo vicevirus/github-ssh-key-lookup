@@ -111,8 +111,11 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	if config.Workers < 1 {
 		config.Workers = 1
 	}
-	if config.Workers > 10 {
-		config.Workers = 10
+	// Independent credential lanes need enough in-flight work to hide the
+	// federation resolver's multi-second latency. The API's own secondary-limit
+	// feedback still slows individual lanes dynamically.
+	if config.Workers > 20 {
+		config.Workers = 20
 	}
 	if config.EnumerationWorkers < 1 {
 		config.EnumerationWorkers = 1
