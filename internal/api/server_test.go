@@ -164,6 +164,29 @@ func TestCompactStatusHidesPreliminaryFederationETA(t *testing.T) {
 	}
 }
 
+func TestCompactStatusDoesNotUsePausedFederationETA(t *testing.T) {
+	officialFinish := time.Now().Add(10 * 24 * time.Hour)
+	snapshot := map[string]any{
+		"progress": map[string]any{"estimated_completion": map[string]any{
+			"fast_scan_finish_early": officialFinish,
+			"fast_scan_finish_late":  officialFinish,
+			"basis":                  "official REST plus federation key queue",
+		}},
+		"federation_sweep": map[string]any{
+			"status": "paused_for_official_pass", "estimated_finish": time.Now().Add(40 * 24 * time.Hour),
+		},
+		"crawler": map[string]any{"online": true}, "coverage": map[string]any{},
+		"recovery": map[string]any{}, "passes": map[string]any{},
+		"lookup": map[string]any{"usable": true}, "index": map[string]any{},
+	}
+	result := compactStatusSnapshot(snapshot)
+	progress := result["progress"].(map[string]any)
+	if progress["estimated_finish_early"] != officialFinish ||
+		progress["estimate_basis"] != "official REST plus federation key queue" {
+		t.Fatalf("paused extended sweep replaced official ETA: %#v", progress)
+	}
+}
+
 func TestParsePaginationDefaultsAndBounds(t *testing.T) {
 	page, err := parsePagination(url.Values{})
 	if err != nil {

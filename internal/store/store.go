@@ -4258,9 +4258,18 @@ func (s *Store) EntitySweepStatus(ctx context.Context) (map[string]any, error) {
 		percentage = 100 * float64(processedIDs) / float64(totalIDs)
 	}
 	status := run.Status
+	schedulerState, err := s.State(ctx, "federation_scheduler_state")
+	if err != nil {
+		return nil, err
+	}
+	if schedulerState == "" {
+		schedulerState = "active"
+	}
 	settled := run.Status == "completed" && queueJobs == 0 && overflowJobs == 0
 	if run.Status == "completed" && !settled {
 		status = "settling_overflow"
+	} else if run.Status == "running" && schedulerState != "active" {
+		status = schedulerState
 	}
 	result := map[string]any{
 		"enabled": true, "run_id": run.ID, "kind": run.Kind,
@@ -4276,10 +4285,12 @@ func (s *Store) EntitySweepStatus(ctx context.Context) (map[string]any, error) {
 		"overflow_jobs": overflowJobs, "started_at": run.StartedAt,
 		"last_progress_at": run.LastProgressAt, "completed_at": run.CompletedAt,
 		"last_error": lastError, "last_error_at": lastErrorAt,
+		"scheduler_state":    schedulerState,
 		"durable_checkpoint": true,
 		"coverage":           "every numeric GitHub actor ID in the inclusive run range",
 	}
-	if run.LastProgressAt != nil && run.LastProgressAt.After(run.StartedAt) && processedIDs > 0 {
+	if schedulerState == "active" && run.LastProgressAt != nil &&
+		run.LastProgressAt.After(run.StartedAt) && processedIDs > 0 {
 		elapsedHours := run.LastProgressAt.Sub(run.StartedAt).Hours()
 		if elapsedHours > 0 {
 			rate := float64(processedIDs) / elapsedHours

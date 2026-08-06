@@ -26,6 +26,8 @@ import (
 
 type Config struct {
 	Workers               int
+	EnumerationWorkers    int
+	KeyBatchSize          int
 	FederationWorkers     int
 	FederationBatchSize   int
 	FederationRecrawl     time.Duration
@@ -48,12 +50,14 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Workers:             1,
+		Workers:             3,
+		EnumerationWorkers:  1,
+		KeyBatchSize:        225,
 		FederationWorkers:   5,
 		FederationBatchSize: 200,
 		FederationRecrawl:   30 * 24 * time.Hour,
 		RESTFallbackWorkers: 1,
-		QueueMax:            10_000,
+		QueueMax:            50_000,
 		RESTPerHour:         4_700,
 		GraphQLPerHour:      3_600,
 		SearchPerHour:       1_500,
@@ -89,12 +93,15 @@ type Service struct {
 	Config  Config
 	Logger  *slog.Logger
 	rest    *ratelimit.Pacer
-	graphql *ratelimit.Pacer
+	graphql *ratelimit.Pool
 	search  *ratelimit.Pacer
 
 	scheduleMu     sync.Mutex
 	scheduleCursor int
 	globalPaused   atomic.Bool
+	graphqlSamples atomic.Uint64
+	keyBatchSize   atomic.Int64
+	keyBatchWins   atomic.Uint64
 }
 
 func New(database *store.Store, github *githubapi.Client, config Config, logger *slog.Logger) *Service {
@@ -107,8 +114,15 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 	if config.Workers > 10 {
 		config.Workers = 10
 	}
+	if config.EnumerationWorkers < 1 {
+		config.EnumerationWorkers = 1
+	}
+	if config.EnumerationWorkers > 10 {
+		config.EnumerationWorkers = 10
+	}
+	config.KeyBatchSize = min(max(config.KeyBatchSize, 100), 250)
 	if config.FederationWorkers < 1 {
-		config.FederationWorkers = 1
+		config.FederationWorkers = 0
 	}
 	if config.FederationWorkers > 20 {
 		config.FederationWorkers = 20
@@ -143,12 +157,16 @@ func New(database *store.Store, github *githubapi.Client, config Config, logger 
 			6 * time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour,
 		}
 	}
-	return &Service{
+	service := &Service{
 		Store: database, GitHub: github, Config: config, Logger: logger,
-		rest:    ratelimit.New(config.RESTPerHour, config.RESTReserve),
-		graphql: ratelimit.New(config.GraphQLPerHour, config.GraphQLReserve),
-		search:  ratelimit.New(config.SearchPerHour, config.SearchReserve),
+		rest: ratelimit.New(config.RESTPerHour, config.RESTReserve),
+		graphql: ratelimit.NewPool(
+			github.CredentialCount(), config.GraphQLPerHour, config.GraphQLReserve,
+		),
+		search: ratelimit.New(config.SearchPerHour, config.SearchReserve),
 	}
+	service.keyBatchSize.Store(int64(config.KeyBatchSize))
+	return service
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -166,7 +184,9 @@ func (s *Service) Run(ctx context.Context) error {
 		"scheduler_allocation":    "global=80%,live=10%,owner=10%; unused capacity is borrowed",
 		"owner_refresh_schedule":  durationList(s.Config.OwnerSchedule),
 		"zero_key_retry_ages":     durationList(s.Config.ZeroKeyRecheckAges),
-		"enumeration_workers":     strconv.Itoa(s.Config.Workers),
+		"enumeration_workers":     strconv.Itoa(s.Config.EnumerationWorkers),
+		"official_key_workers":    strconv.Itoa(s.Config.Workers),
+		"official_key_batch_size": strconv.Itoa(s.Config.KeyBatchSize),
 		"federation_workers":      strconv.Itoa(s.Config.FederationWorkers),
 		"federation_batch_size":   strconv.Itoa(s.Config.FederationBatchSize),
 		"federation_recrawl":      s.Config.FederationRecrawl.String(),
@@ -177,9 +197,20 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 	s.recordPacer(ctx, "rest", s.rest)
-	s.recordPacer(ctx, "graphql", s.graphql)
+	s.recordGraphQLPacer(ctx)
 	s.recordPacer(ctx, "search", s.search)
 	if _, err := s.Store.EnsureMainRun(ctx, s.GitHub.UsersURL(0)); err != nil {
+		return err
+	}
+	initialComplete, err := s.Store.State(ctx, "initial_complete")
+	if err != nil {
+		return err
+	}
+	federationMode := "active"
+	if initialComplete != "true" {
+		federationMode = "paused_for_official_pass"
+	}
+	if err := s.Store.SetState(ctx, "federation_scheduler_state", federationMode); err != nil {
 		return err
 	}
 	s.workerActivity(ctx, "scheduler", "scheduler", "running", "crawler started")
@@ -188,7 +219,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// Enumeration workers are permanent. They wait while a run drains and then
 	// initialize and process the next reconciliation run without requiring a
 	// crawler restart.
-	for worker := 0; worker < s.Config.Workers; worker++ {
+	for worker := 0; worker < s.Config.EnumerationWorkers; worker++ {
 		workerID := worker
 		group.Go(func() error { return s.enumerateShardWorker(groupCtx, workerID) })
 	}
@@ -227,6 +258,27 @@ func (s *Service) entitySweepWorker(ctx context.Context, workerID int) error {
 	defer s.Store.StopWorker(context.Background(), worker, role)
 	successesAtCurrentSize := 0
 	for ctx.Err() == nil {
+		initialComplete, err := s.Store.State(ctx, "initial_complete")
+		if err != nil {
+			return err
+		}
+		if initialComplete != "true" {
+			s.workerActivity(ctx, worker, role, "waiting",
+				"paused until the official searchable-account pass is settled")
+			if err := sleep(ctx, 5*time.Second); err != nil {
+				return nil
+			}
+			continue
+		}
+		mode, err := s.Store.State(ctx, "federation_scheduler_state")
+		if err != nil {
+			return err
+		}
+		if mode != "active" {
+			if err := s.Store.SetState(ctx, "federation_scheduler_state", "active"); err != nil {
+				return err
+			}
+		}
 		if _, err := s.Store.EnsureEntitySweepRun(
 			ctx, s.Config.FederationWorkers, s.Config.FederationBatchSize,
 			s.Config.FederationRecrawl,
@@ -257,16 +309,17 @@ func (s *Service) entitySweepWorker(ctx context.Context, workerID int) error {
 			}
 			s.workerActivity(ctx, worker, role, "running",
 				fmt.Sprintf("resolving numeric IDs %d..%d", databaseIDs[0], databaseIDs[len(databaseIDs)-1]))
-			if err := s.graphql.Wait(ctx); err != nil {
+			requestCtx, lane, err := s.waitGraphQL(ctx)
+			if err != nil {
 				_ = s.Store.RequeueEntitySweepShard(
 					context.Background(), shard, err, shard.BatchSize,
 				)
 				return nil
 			}
-			response, err := s.GitHub.FetchUsersByDatabaseIDs(ctx, databaseIDs)
+			response, err := s.GitHub.FetchUsersByDatabaseIDs(requestCtx, databaseIDs)
 			if err != nil {
 				s.workerError(ctx, worker, role, "federation batch failed", err)
-				s.handleRateError(ctx, err, s.graphql, "graphql")
+				s.handleGraphQLError(ctx, lane, err)
 				nextBatchSize := shard.BatchSize
 				if githubapi.IsGatewayTimeout(err) {
 					nextBatchSize = max(25, shard.BatchSize/2)
@@ -277,14 +330,13 @@ func (s *Service) entitySweepWorker(ctx context.Context, workerID int) error {
 				); retryErr != nil {
 					return retryErr
 				}
-				if isAuthenticationError(err) {
+				if s.authenticationExhausted(err) {
 					return err
 				}
 				_ = sleep(ctx, retryDelay(err, shard.Attempts))
 				break
 			}
-			s.graphql.Observe(response.Rate)
-			s.graphql.ExtraCost(response.Rate.Cost)
+			s.observeGraphQL(ctx, lane, response.Rate)
 			results, resolvedUsers, keyOwners, keyCount, err :=
 				normalizeEntityUsers(databaseIDs, response.Nodes)
 			if err != nil {
@@ -485,7 +537,7 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 			return nil
 		}
 		if err := s.Store.EnsureEnumerationShards(
-			ctx, run, s.Config.Workers, s.GitHub.UsersURL,
+			ctx, run, s.Config.EnumerationWorkers, s.GitHub.UsersURL,
 		); err != nil {
 			return err
 		}
@@ -528,7 +580,7 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 			if !reached {
 				previousUpper := shard.UpperID
 				newUpper, err := s.Store.RebalanceOwnedEnumerationShard(
-					ctx, shard, s.Config.Workers, s.GitHub.UsersURL,
+					ctx, shard, s.Config.EnumerationWorkers, s.GitHub.UsersURL,
 				)
 				if err != nil {
 					return err
@@ -771,7 +823,9 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			return err
 		}
 		preferredClass := s.nextQueueClass()
-		jobs, err := s.Store.ClaimScheduledAccounts(ctx, 100, preferredClass)
+		jobs, err := s.Store.ClaimScheduledAccounts(
+			ctx, s.currentKeyBatchSize(), preferredClass,
+		)
 		if err != nil {
 			return err
 		}
@@ -781,20 +835,24 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 			}
 			continue
 		}
-		ids := make([]string, len(jobs))
+		databaseIDs := make([]int64, len(jobs))
 		for index := range jobs {
-			ids[index] = jobs[index].NodeID
+			databaseIDs[index] = jobs[index].GitHubID
 		}
-		if err := s.graphql.Wait(ctx); err != nil {
+		requestCtx, lane, err := s.waitGraphQL(ctx)
+		if err != nil {
 			_ = s.Store.RequeueAccountsAfter(
 				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
 			)
 			return nil
 		}
-		response, err := s.GitHub.FetchUsers(ctx, ids)
+		response, err := s.GitHub.FetchUsersByDatabaseIDs(requestCtx, databaseIDs)
 		if err != nil {
 			s.workerError(ctx, worker, role, "GraphQL account batch failed", err)
-			s.handleRateError(ctx, err, s.graphql, "graphql")
+			s.handleGraphQLError(ctx, lane, err)
+			if githubapi.IsGatewayTimeout(err) {
+				s.reduceKeyBatchSize(len(jobs) / 2)
+			}
 			fallback, retry := splitFailedGraphQLBatch(jobs, err)
 			if len(fallback) > 0 {
 				if moveErr := s.Store.MoveAccountsToRESTFallback(
@@ -811,15 +869,15 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 					return fmt.Errorf("persist GraphQL retry: %w", retryErr)
 				}
 			}
-			if isAuthenticationError(err) {
+			if s.authenticationExhausted(err) {
 				return err
 			}
 			s.Logger.Warn("GraphQL batch failed", "worker", workerID, "users", len(jobs), "error", err)
 			continue
 		}
-		s.graphql.Observe(response.Rate)
-		s.graphql.ExtraCost(response.Rate.Cost)
-		results, resultErrors, err := normalizeUsers(jobs, response.Nodes)
+		s.observeGraphQL(ctx, lane, response.Rate)
+		s.adjustKeyBatchSize(response.Elapsed)
+		results, resultErrors, err := normalizeResourceUsers(jobs, response.Nodes)
 		if err != nil {
 			if moveErr := s.Store.MoveAccountsToRESTFallback(
 				context.Background(), jobs, err,
@@ -900,11 +958,47 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 	return nil
 }
 
+func (s *Service) currentKeyBatchSize() int {
+	return min(max(int(s.keyBatchSize.Load()), 100), 250)
+}
+
+func (s *Service) reduceKeyBatchSize(candidate int) {
+	candidate = min(max(candidate, 100), 250)
+	for {
+		current := s.keyBatchSize.Load()
+		if int64(candidate) >= current || s.keyBatchSize.CompareAndSwap(current, int64(candidate)) {
+			return
+		}
+	}
+}
+
+func (s *Service) adjustKeyBatchSize(elapsed time.Duration) {
+	if elapsed > 8*time.Second {
+		s.reduceKeyBatchSize(s.currentKeyBatchSize() - 25)
+		s.keyBatchWins.Store(0)
+		return
+	}
+	if elapsed >= 7*time.Second || s.currentKeyBatchSize() >= 250 {
+		s.keyBatchWins.Store(0)
+		return
+	}
+	if s.keyBatchWins.Add(1) >= 50 {
+		s.keyBatchWins.Store(0)
+		for {
+			current := s.keyBatchSize.Load()
+			next := min(current+5, int64(250))
+			if current >= 250 || s.keyBatchSize.CompareAndSwap(current, next) {
+				return
+			}
+		}
+	}
+}
+
 func splitFailedGraphQLBatch(
 	jobs []model.Candidate, err error,
 ) (fallback, retry []model.Candidate) {
 	var limited *githubapi.RateLimitError
-	if errors.As(err, &limited) || isAuthenticationError(err) {
+	if errors.As(err, &limited) || githubapi.IsGatewayTimeout(err) || isAuthenticationError(err) {
 		return nil, jobs
 	}
 	for _, job := range jobs {
@@ -951,28 +1045,28 @@ func (s *Service) processResourceRepairBatch(
 	for index := range jobs {
 		logins[index] = jobs[index].Login
 	}
-	if err := s.graphql.Wait(ctx); err != nil {
+	requestCtx, lane, err := s.waitGraphQL(ctx)
+	if err != nil {
 		_ = s.Store.RequeueRESTFallbackBatchAfter(
 			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
 		)
 		return nil
 	}
-	response, err := s.GitHub.FetchUsersByResources(ctx, logins)
+	response, err := s.GitHub.FetchUsersByResources(requestCtx, logins)
 	if err != nil {
 		s.workerError(ctx, worker, role, "GraphQL URL-resource batch failed", err)
-		s.handleRateError(ctx, err, s.graphql, "graphql")
+		s.handleGraphQLError(ctx, lane, err)
 		if retryErr := s.Store.RequeueRESTFallbackBatchAfter(
 			context.Background(), jobs, err, retryDelay(err, maxFallbackAttempts(jobs)),
 		); retryErr != nil {
 			return retryErr
 		}
-		if isAuthenticationError(err) {
+		if s.authenticationExhausted(err) {
 			return err
 		}
 		return nil
 	}
-	s.graphql.Observe(response.Rate)
-	s.graphql.ExtraCost(response.Rate.Cost)
+	s.observeGraphQL(ctx, lane, response.Rate)
 	results, resultErrors, err := normalizeResourceUsers(jobs, response.Nodes)
 	if err != nil {
 		if retryErr := s.Store.RequeueRESTFallbackBatchAfter(
@@ -1189,48 +1283,36 @@ func (s *Service) nextQueueClass() string {
 func (s *Service) processOverflow(ctx context.Context, workerID int, job model.OverflowJob) error {
 	worker := fmt.Sprintf("graphql-%d", workerID)
 	role := "SSH key batch worker"
-	if err := s.graphql.Wait(ctx); err != nil {
+	requestCtx, lane, err := s.waitGraphQL(ctx)
+	if err != nil {
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		return nil
 	}
-	var user *githubapi.GraphQLUser
-	var rate model.Rate
-	var err error
-	if job.Cursor == "" {
-		var response githubapi.UsersAndKeys
-		response, err = s.GitHub.FetchUsers(ctx, []string{job.NodeID})
-		if err == nil {
-			rate = response.Rate
-			if len(response.Nodes) == 1 {
-				user = response.Nodes[0]
-			}
-		}
-	} else {
-		user, rate, err = s.GitHub.MoreKeys(ctx, job.NodeID, job.Cursor)
-	}
+	user, rate, err := s.GitHub.MoreKeysByDatabaseID(
+		requestCtx, job.GitHubID, job.Cursor,
+	)
 	if err != nil {
 		s.workerError(ctx, worker, role, "GraphQL overflow page failed", err)
-		s.handleRateError(ctx, err, s.graphql, "graphql")
+		s.handleGraphQLError(ctx, lane, err)
 		var limited *githubapi.RateLimitError
 		if job.Attempts >= 3 && !errors.As(err, &limited) && !isAuthenticationError(err) {
 			return s.processOverflowREST(ctx, worker, role, job)
 		}
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
-		if isAuthenticationError(err) {
+		if s.authenticationExhausted(err) {
 			return err
 		}
 		_ = sleep(ctx, retryDelay(err, job.Attempts))
 		return nil
 	}
-	s.graphql.Observe(rate)
-	s.graphql.ExtraCost(rate.Cost)
+	s.observeGraphQL(ctx, lane, rate)
 	if user == nil {
 		return s.processOverflowREST(ctx, worker, role, job)
 	}
-	if user.ID != job.NodeID || user.DatabaseID != job.GitHubID {
+	if user.TypeName != "User" || user.DatabaseID != job.GitHubID {
 		err = fmt.Errorf(
-			"overflow identity mismatch: expected %s/%d, received %s/%d",
-			job.NodeID, job.GitHubID, user.ID, user.DatabaseID,
+			"overflow identity mismatch: expected database ID %d, received %s/%d",
+			job.GitHubID, user.ID, user.DatabaseID,
 		)
 		_ = s.Store.RequeueOverflowAfter(
 			context.Background(), job, err, retryDelay(err, job.Attempts),
@@ -2020,7 +2102,7 @@ func (s *Service) monitorRuns(ctx context.Context) error {
 					return err
 				}
 				now := time.Now()
-				graphqlCooldown := s.graphql.Snapshot().CooldownUntil
+				graphqlCooldown := s.graphql.Snapshot(s.GitHub.CredentialActive).CooldownUntil
 				if due && graphqlCooldown == nil && now.Sub(monitorStarted) > 10*time.Minute &&
 					(graphQLSuccess == nil || now.Sub(*graphQLSuccess) > 10*time.Minute) {
 					return errors.New("GraphQL watchdog: due work made no progress for 10 minutes")
@@ -2137,6 +2219,41 @@ func (s *Service) handleRateError(
 	}
 }
 
+func (s *Service) waitGraphQL(ctx context.Context) (context.Context, int, error) {
+	lane, err := s.graphql.Wait(ctx, s.GitHub.CredentialActive)
+	if err != nil {
+		return ctx, -1, err
+	}
+	return githubapi.WithCredential(ctx, lane), lane, nil
+}
+
+func (s *Service) observeGraphQL(ctx context.Context, lane int, rate model.Rate) {
+	s.graphql.Observe(lane, rate)
+	s.graphql.ExtraCost(lane, rate.Cost)
+	if s.graphqlSamples.Add(1)%100 == 0 {
+		s.recordGraphQLPacer(ctx)
+	}
+}
+
+func (s *Service) handleGraphQLError(ctx context.Context, lane int, err error) {
+	var limited *githubapi.RateLimitError
+	if errors.As(err, &limited) {
+		if limited.Secondary {
+			s.graphql.SecondaryLimit(lane, limited.Wait)
+		} else {
+			s.graphql.Cooldown(lane, limited.Wait)
+		}
+	}
+	s.recordGraphQLPacer(ctx)
+}
+
+func (s *Service) recordGraphQLPacer(ctx context.Context) {
+	_ = s.Store.SetState(
+		ctx, "graphql_pacer",
+		store.JSON(s.graphql.Snapshot(s.GitHub.CredentialActive)),
+	)
+}
+
 func (s *Service) recordPacer(
 	ctx context.Context,
 	resource string,
@@ -2172,6 +2289,10 @@ func maxJobAttempts(jobs []model.Candidate) int {
 func isAuthenticationError(err error) bool {
 	var authentication *githubapi.AuthenticationError
 	return errors.As(err, &authentication)
+}
+
+func (s *Service) authenticationExhausted(err error) bool {
+	return isAuthenticationError(err) && s.GitHub.ActiveCredentialCount() == 0
 }
 
 func sleep(ctx context.Context, duration time.Duration) error {

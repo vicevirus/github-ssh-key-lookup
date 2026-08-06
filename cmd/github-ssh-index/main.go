@@ -126,6 +126,10 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	}
 	config := crawler.DefaultConfig()
 	config.Workers = envInt("GRAPHQL_WORKERS", config.Workers) * credentialCount
+	config.EnumerationWorkers = envInt(
+		"REST_ENUMERATION_WORKERS", config.EnumerationWorkers,
+	) * credentialCount
+	config.KeyBatchSize = envInt("GRAPHQL_KEY_BATCH_SIZE", config.KeyBatchSize)
 	config.FederationWorkers = envInt(
 		"FEDERATION_WORKERS", config.FederationWorkers,
 	) * credentialCount
@@ -140,7 +144,9 @@ func crawlerService(database *store.Store, logger *slog.Logger) *crawler.Service
 	) * credentialCount
 	config.QueueMax = envInt("QUEUE_MAX_ACCOUNTS", config.QueueMax)
 	config.RESTPerHour = envInt("REST_REQUESTS_PER_HOUR", config.RESTPerHour) * credentialCount
-	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour) * credentialCount
+	// GraphQL pacing is isolated per credential. Unlike the aggregate REST and
+	// Search pacers, this value is deliberately not multiplied here.
+	config.GraphQLPerHour = envInt("GRAPHQL_POINTS_PER_HOUR", config.GraphQLPerHour)
 	config.SearchPerHour = envInt("SEARCH_REQUESTS_PER_HOUR", config.SearchPerHour) * credentialCount
 	config.TailPollInterval = envDuration("TAIL_POLL_INTERVAL", config.TailPollInterval)
 	config.OwnerRefresh = envDuration("OWNER_REFRESH_INTERVAL", config.OwnerRefresh)

@@ -373,6 +373,38 @@ func TestCredentialPoolIgnoresEmptyAndDuplicateTokens(t *testing.T) {
 	}
 }
 
+func TestForcedCredentialAndFederationOverflow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer token-b" {
+			t.Fatalf("request used an unreserved credential: %q", request.Header.Get("Authorization"))
+		}
+		var body struct {
+			Variables struct {
+				Representations []map[string]any `json:"representations"`
+				After           string           `json:"after"`
+			} `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Variables.Representations) != 1 ||
+			body.Variables.Representations[0]["databaseId"] != "42" ||
+			body.Variables.After != "cursor" {
+			t.Fatalf("unexpected federation overflow variables: %#v", body.Variables)
+		}
+		_, _ = response.Write([]byte(`{"data":{"_entities":[{"__typename":"User","id":"U_42","databaseId":42,"login":"alice","createdAt":"2020-01-01T00:00:00Z","publicKeys":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}],"rateLimit":{"cost":1,"limit":5000,"remaining":4999,"used":1,"resetAt":"2026-08-02T09:00:00Z"}}}`))
+	}))
+	defer server.Close()
+	client := NewWithTokens([]string{"token-a", "token-b"}, "test")
+	client.GraphQLURL = server.URL + "/graphql"
+	client.HTTP = server.Client()
+	ctx := WithCredential(context.Background(), 1)
+	user, rate, err := client.MoreKeysByDatabaseID(ctx, 42, "cursor")
+	if err != nil || user == nil || user.DatabaseID != 42 || rate.Cost != 1 {
+		t.Fatalf("unexpected federation overflow result: user=%#v rate=%#v err=%v", user, rate, err)
+	}
+}
+
 func TestFetchUsersClassifiesSecondaryRateLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusForbidden)

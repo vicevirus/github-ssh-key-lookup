@@ -74,6 +74,25 @@ query MoreKeys($id: ID!, $after: String!) {
   rateLimit { cost limit remaining used resetAt }
 }`
 
+const moreKeysByDatabaseIDQuery = `
+query MoreKeysByDatabaseID($representations: [_Any!]!, $after: String) {
+  _entities(representations: $representations) {
+    __typename
+    ... on User {
+      id
+      databaseId
+      login
+      createdAt
+      publicKeys(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { key fingerprint }
+      }
+    }
+  }
+  rateLimit { cost limit remaining used resetAt }
+}`
+
 const resourceUserFields = `
     __typename
     ... on User {
@@ -106,6 +125,15 @@ type Client struct {
 type credential struct {
 	token    string
 	disabled bool
+}
+
+type credentialContextKey struct{}
+
+// WithCredential binds one request to a paced credential lane. The crawler
+// reserves the lane before calling the client, so silently switching tokens
+// here would bypass the replacement credential's limiter.
+func WithCredential(ctx context.Context, index int) context.Context {
+	return context.WithValue(ctx, credentialContextKey{}, index)
 }
 
 type RESTUser struct {
@@ -275,6 +303,12 @@ func (c *Client) ActiveCredentialCount() int {
 		}
 	}
 	return active
+}
+
+func (c *Client) CredentialActive(index int) bool {
+	c.credentialsMu.RLock()
+	defer c.credentialsMu.RUnlock()
+	return index >= 0 && index < len(c.credentials) && !c.credentials[index].disabled
 }
 
 func (c *Client) UsersURL(since int64) string {
@@ -610,6 +644,54 @@ func (c *Client) FetchUsersByDatabaseIDs(
 	}, nil
 }
 
+// MoreKeysByDatabaseID paginates the same federation identity used by the
+// high-throughput account path. It remains usable for accounts that resolve
+// through _entities but return null through node(id:).
+func (c *Client) MoreKeysByDatabaseID(
+	ctx context.Context, databaseID int64, after string,
+) (*GraphQLUser, model.Rate, error) {
+	if databaseID <= 0 {
+		return nil, model.Rate{}, fmt.Errorf("invalid GitHub database ID: %d", databaseID)
+	}
+	representations := []map[string]any{{
+		"__typename": "User", "databaseId": strconv.FormatInt(databaseID, 10),
+	}}
+	var envelope struct {
+		Data struct {
+			Entities  []*GraphQLUser `json:"_entities"`
+			RateLimit graphQLRate    `json:"rateLimit"`
+		} `json:"data"`
+		Errors []graphQLError `json:"errors"`
+	}
+	_, err := c.graphql(ctx, moreKeysByDatabaseIDQuery, map[string]any{
+		"representations": representations, "after": nullableCursor(after),
+	}, &envelope)
+	if err != nil {
+		return nil, model.Rate{}, err
+	}
+	rate := envelope.Data.RateLimit.model()
+	if limited := graphQLRateError(envelope.Errors, envelope.Data.RateLimit); limited != nil {
+		return nil, rate, limited
+	}
+	if len(envelope.Data.Entities) != 1 {
+		return nil, rate, fmt.Errorf(
+			"GitHub returned %d federation entities for one database ID",
+			len(envelope.Data.Entities),
+		)
+	}
+	if _, err := federationNotFoundPositions(envelope.Errors, 1); err != nil {
+		return nil, rate, err
+	}
+	return envelope.Data.Entities[0], rate, nil
+}
+
+func nullableCursor(cursor string) any {
+	if cursor == "" {
+		return nil
+	}
+	return cursor
+}
+
 func federationNotFoundPositions(errors []graphQLError, size int) (map[int]bool, error) {
 	positions := make(map[int]bool, len(errors))
 	for _, item := range errors {
@@ -804,6 +886,25 @@ func (c *Client) headers(req *http.Request) {
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
+	if forced, ok := req.Context().Value(credentialContextKey{}).(int); ok {
+		token, active := c.credential(forced)
+		if !active {
+			return nil, errors.New("selected GitHub credential is disabled")
+		}
+		attempt, err := replayRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		attempt.Header.Set("Authorization", "Bearer "+token)
+		response, err := c.HTTP.Do(attempt)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			c.disableCredential(forced)
+		}
+		return response, nil
+	}
 	start := c.nextCredential(req)
 	count := c.CredentialCount()
 	if count == 0 {

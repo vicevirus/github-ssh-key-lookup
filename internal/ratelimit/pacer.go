@@ -36,6 +36,31 @@ func New(perHour, reserve int) *Pacer {
 }
 
 func (p *Pacer) Wait(ctx context.Context) error {
+	at := p.ReserveAfter(time.Time{})
+	return waitUntil(ctx, at)
+}
+
+// ReadyAt reports when a new reservation could start without mutating the
+// pacer. Pool uses this to choose the credential lane that can run first.
+func (p *Pacer) ReadyAt(notBefore time.Time) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	at := p.next
+	if at.Before(now) {
+		at = now
+	}
+	if at.Before(p.cooldown) {
+		at = p.cooldown
+	}
+	if at.Before(notBefore) {
+		at = notBefore
+	}
+	return at
+}
+
+// ReserveAfter atomically reserves one request slot at or after notBefore.
+func (p *Pacer) ReserveAfter(notBefore time.Time) time.Time {
 	p.mu.Lock()
 	now := time.Now()
 	at := p.next
@@ -45,8 +70,15 @@ func (p *Pacer) Wait(ctx context.Context) error {
 	if at.Before(p.cooldown) {
 		at = p.cooldown
 	}
+	if at.Before(notBefore) {
+		at = notBefore
+	}
 	p.next = at.Add(p.interval)
 	p.mu.Unlock()
+	return at
+}
+
+func waitUntil(ctx context.Context, at time.Time) error {
 	timer := time.NewTimer(time.Until(at))
 	defer timer.Stop()
 	select {
