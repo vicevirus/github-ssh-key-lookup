@@ -92,11 +92,14 @@ func (s *Server) status(response http.ResponseWriter, request *http.Request) {
 	s.statusMu.Lock()
 	snapshot, fetched := s.statusSnapshot, s.statusFetched
 	s.statusMu.Unlock()
-	if snapshot == nil {
+	// The crawler persists a fresh status every minute. Reload that cheap
+	// snapshot whenever this API process is stale instead of depending on a
+	// second expensive full-table calculation finishing inside its timeout.
+	if snapshot == nil || now.Sub(fetched) >= statusCacheTTL {
 		ctx, cancel := context.WithTimeout(request.Context(), 500*time.Millisecond)
 		persisted, persistedAt, err := s.Store.LoadStatusSnapshot(ctx)
 		cancel()
-		if err == nil {
+		if err == nil && (snapshot == nil || persistedAt.After(fetched)) {
 			snapshot, fetched = persisted, persistedAt
 			s.statusMu.Lock()
 			s.statusSnapshot, s.statusFetched = persisted, persistedAt
