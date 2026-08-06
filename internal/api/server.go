@@ -182,10 +182,15 @@ func compactStatusSnapshot(snapshot map[string]any) map[string]any {
 	estimateBasis := estimate["basis"]
 	estimatePreliminary := estimate["rate_is_preliminary"]
 	if federation != nil && federation["status"] == "running" {
-		if finish := federation["estimated_finish"]; finish != nil {
+		estimateBasis = "dense GraphQL federation ID sweep measured throughput"
+		estimatePreliminary = federation["estimate_preliminary"]
+		if preliminary, _ := federation["estimate_preliminary"].(bool); preliminary {
+			// Startup, quota resets and the first secondary-limit calibration make
+			// a short-window ETA actively misleading. Expose progress/rate now and
+			// publish the completion date after one measured hour.
+			fastFinishEarly, fastFinishLate = nil, nil
+		} else if finish := federation["estimated_finish"]; finish != nil {
 			fastFinishEarly, fastFinishLate = finish, finish
-			estimateBasis = "dense GraphQL federation ID sweep measured throughput"
-			estimatePreliminary = federation["estimate_preliminary"]
 		}
 	}
 
