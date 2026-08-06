@@ -1132,6 +1132,82 @@ func TestEnumerationShardsAreNotDuplicatedAfterRestart(t *testing.T) {
 	}
 }
 
+func TestSeedEnumerationRepairIsDurableContiguousAndIdempotent(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InitializeLiveTail(
+		ctx, 1_000, "https://api.github.com/users?since=1000&per_page=100",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `
+		UPDATE crawl_runs SET enumeration_complete=true WHERE id=$1
+	`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	urlFor := func(since int64) string {
+		return "https://api.github.com/users?since=" + strconv.FormatInt(since, 10)
+	}
+	inserted, err := database.SeedEnumerationRepair(ctx, 100, 900, 4, urlFor)
+	if err != nil || inserted != 4 {
+		t.Fatalf("seed repair: inserted=%d err=%v", inserted, err)
+	}
+	inserted, err = database.SeedEnumerationRepair(ctx, 100, 900, 4, urlFor)
+	if err != nil || inserted != 0 {
+		t.Fatalf("idempotent repair seed: inserted=%d err=%v", inserted, err)
+	}
+
+	rows, err := database.Pool.Query(ctx, `
+		SELECT purpose, lower_id, upper_id, next_since_id, next_url
+		FROM enumeration_shards WHERE run_id=$1 ORDER BY lower_id
+	`, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ranges [][2]int64
+	for rows.Next() {
+		var lower, upper, nextSince int64
+		var purpose, nextURL string
+		if err := rows.Scan(&purpose, &lower, &upper, &nextSince, &nextURL); err != nil {
+			t.Fatal(err)
+		}
+		if purpose != "repair" {
+			t.Fatalf("seeded shard purpose=%q, want repair", purpose)
+		}
+		if nextSince != lower || nextURL != urlFor(lower) {
+			t.Fatalf("repair checkpoint was not initialized at lower bound: %d %q", nextSince, nextURL)
+		}
+		ranges = append(ranges, [2]int64{lower, upper})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 4 || ranges[0][0] != 100 || ranges[3][1] != 900 {
+		t.Fatalf("unexpected repair ranges: %#v", ranges)
+	}
+	for index := 1; index < len(ranges); index++ {
+		if ranges[index-1][1] != ranges[index][0] {
+			t.Fatalf("repair ranges contain a gap: %#v", ranges)
+		}
+	}
+	var complete bool
+	if err := database.Pool.QueryRow(ctx, `
+		SELECT enumeration_complete FROM crawl_runs WHERE id=$1
+	`, run.ID).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("repair seed left the active run marked complete")
+	}
+}
+
 func TestOwnedEnumerationShardRebalancesIdleWorkersWithoutGaps(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()

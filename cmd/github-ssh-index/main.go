@@ -54,6 +54,36 @@ func run() error {
 	case "migrate":
 		logger.Info("database migrated")
 		return nil
+	case "repair-range":
+		if len(os.Args) != 5 {
+			return errors.New("usage: github-ssh-index repair-range LOWER_ID UPPER_ID SHARDS")
+		}
+		lowerID, err := strconv.ParseInt(os.Args[2], 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse repair lower ID: %w", err)
+		}
+		upperID, err := strconv.ParseInt(os.Args[3], 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse repair upper ID: %w", err)
+		}
+		shards, err := strconv.Atoi(os.Args[4])
+		if err != nil {
+			return fmt.Errorf("parse repair shard count: %w", err)
+		}
+		restBase := strings.TrimRight(env("GITHUB_REST_BASE", "https://api.github.com"), "/")
+		seeded, err := database.SeedEnumerationRepair(
+			ctx, lowerID, upperID, shards,
+			func(since int64) string {
+				return fmt.Sprintf("%s/users?since=%d&per_page=100", restBase, since)
+			},
+		)
+		if err != nil {
+			return err
+		}
+		logger.Info("durable enumeration repair seeded",
+			"lower_id", lowerID, "upper_id", upperID,
+			"requested_shards", shards, "inserted_shards", seeded)
+		return nil
 	case "status":
 		status, err := database.Status(ctx)
 		if err != nil {
@@ -76,7 +106,7 @@ func run() error {
 			return err
 		}
 	default:
-		return fmt.Errorf("unknown command %q (use migrate, crawl, api, all, status, or healthcheck)", command)
+		return fmt.Errorf("unknown command %q (use migrate, repair-range, crawl, api, all, status, or healthcheck)", command)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -251,27 +252,13 @@ func (s *Service) enumerateShardWorker(ctx context.Context, workerID int) error 
 				break
 			}
 			s.rest.Observe(page.Rate)
-			candidates := make([]model.Candidate, 0, len(page.Objects))
-			nextSince := shard.NextSinceID
-			reached := len(page.Objects) == 0 || page.NextURL == ""
-			for _, object := range page.Objects {
-				if object.ID > nextSince {
-					nextSince = object.ID
-				}
-				if object.ID > shard.UpperID {
-					reached = true
-					continue
-				}
-				if object.Type == "User" && object.NodeID != "" {
-					candidates = append(candidates, model.Candidate{GitHubID: object.ID, NodeID: object.NodeID, Login: object.Login})
-				}
-			}
-			if reached {
-				nextSince = shard.UpperID
-			}
-			nextURL := page.NextURL
-			if reached {
-				nextURL = s.GitHub.UsersURL(shard.UpperID)
+			candidates, nextSince, nextURL, reached, err := planEnumerationPage(
+				shard, page, s.GitHub.UsersURL,
+			)
+			if err != nil {
+				s.workerError(ctx, worker, role, "REST shard pagination could not prove continuity", err)
+				_ = s.Store.RequeueEnumerationShard(context.Background(), shard, err)
+				break
 			}
 			if err := s.Store.ApplyEnumerationShardPage(ctx, shard, candidates, nextSince, nextURL, reached); err != nil {
 				return err
@@ -364,6 +351,72 @@ func (s *Service) prefill(ctx context.Context) {
 	}
 }
 
+func planEnumerationPage(
+	shard store.EnumerationShard,
+	page githubapi.UsersPage,
+	urlFor func(int64) string,
+) ([]model.Candidate, int64, string, bool, error) {
+	if shard.NextSinceID >= shard.UpperID {
+		return nil, shard.UpperID, urlFor(shard.UpperID), true, nil
+	}
+	if len(page.Objects) == 0 {
+		return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
+			"empty REST users page before shard boundary: since=%d upper=%d",
+			shard.NextSinceID, shard.UpperID,
+		)
+	}
+
+	candidates := make([]model.Candidate, 0, len(page.Objects))
+	previous := shard.NextSinceID
+	crossedBoundary := false
+	for _, object := range page.Objects {
+		if object.ID <= previous {
+			return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
+				"non-monotonic REST users page: previous=%d current=%d",
+				previous, object.ID,
+			)
+		}
+		previous = object.ID
+		if object.ID > shard.UpperID {
+			crossedBoundary = true
+			continue
+		}
+		if crossedBoundary {
+			return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
+				"REST users page returned an in-range ID after crossing boundary %d",
+				shard.UpperID,
+			)
+		}
+		if object.Type == "User" && object.NodeID != "" {
+			candidates = append(candidates, model.Candidate{
+				GitHubID: object.ID, NodeID: object.NodeID, Login: object.Login,
+			})
+		}
+	}
+	if crossedBoundary || previous >= shard.UpperID {
+		return candidates, shard.UpperID, urlFor(shard.UpperID), true, nil
+	}
+	if page.NextURL == "" {
+		return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
+			"REST users page omitted next link before shard boundary: since=%d last=%d upper=%d",
+			shard.NextSinceID, previous, shard.UpperID,
+		)
+	}
+	next, err := url.Parse(page.NextURL)
+	if err != nil {
+		return nil, shard.NextSinceID, shard.NextURL, false,
+			fmt.Errorf("parse REST users next link: %w", err)
+	}
+	linkSince, err := strconv.ParseInt(next.Query().Get("since"), 10, 64)
+	if err != nil || linkSince != previous {
+		return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
+			"REST users next cursor does not match page: link_since=%q last=%d",
+			next.Query().Get("since"), previous,
+		)
+	}
+	return candidates, previous, page.NextURL, false, nil
+}
+
 func (s *Service) enumerateMain(ctx context.Context) error {
 	const worker = "rest-enumerator"
 	const role = "global account enumeration"
@@ -403,31 +456,23 @@ func (s *Service) enumerateMain(ctx context.Context) error {
 		}
 		failures = 0
 		s.rest.Observe(page.Rate)
-		maxSeen := run.NextSinceID
-		reachedCutoff := false
-		candidates := make([]model.Candidate, 0, len(page.Objects))
-		for _, object := range page.Objects {
-			if object.ID > maxSeen {
-				maxSeen = object.ID
-			}
-			if run.CutoffUserID != nil && object.ID > *run.CutoffUserID {
-				reachedCutoff = true
-				continue
-			}
-			if object.Type != "User" || object.NodeID == "" {
-				continue
-			}
-			candidates = append(candidates, model.Candidate{
-				GitHubID: object.ID, NodeID: object.NodeID, Login: object.Login,
-			})
+		if run.CutoffUserID == nil {
+			return errors.New("global enumeration run has no fixed cutoff")
 		}
-		complete := len(page.Objects) == 0 || page.NextURL == "" || reachedCutoff
-		if run.CutoffUserID != nil && maxSeen >= *run.CutoffUserID {
-			complete = true
+		shard := store.EnumerationShard{
+			RunID: run.ID, NextSinceID: run.NextSinceID,
+			NextURL: run.NextURL, UpperID: *run.CutoffUserID,
 		}
-		nextURL := page.NextURL
-		if nextURL == "" {
-			nextURL = s.GitHub.UsersURL(maxSeen)
+		candidates, maxSeen, nextURL, complete, err := planEnumerationPage(
+			shard, page, s.GitHub.UsersURL,
+		)
+		if err != nil {
+			failures++
+			s.workerError(ctx, worker, role, "REST pagination could not prove continuity", err)
+			if err := sleep(ctx, retryDelay(err, failures)); err != nil {
+				return nil
+			}
+			continue
 		}
 		if err := s.Store.ApplyEnumerationPage(
 			ctx, run, candidates, maxSeen, nextURL, complete,

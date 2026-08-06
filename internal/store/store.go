@@ -51,6 +51,7 @@ type Run struct {
 type EnumerationShard struct {
 	ID                   int64
 	RunID                int64
+	Purpose              string
 	LowerID              int64
 	UpperID              int64
 	NextSinceID          int64
@@ -1238,6 +1239,103 @@ func (s *Store) EnsureEnumerationShards(ctx context.Context, run Run, count int,
 	return tx.Commit(ctx)
 }
 
+// SeedEnumerationRepair adds an overlapping, durable set of shards to the
+// active run. Existing observations and indexed keys are retained; accounts
+// encountered again are processed as fresh observations so historical gaps
+// can be repaired before the run is allowed to complete.
+func (s *Store) SeedEnumerationRepair(
+	ctx context.Context,
+	lowerID, upperID int64,
+	count int,
+	urlFor func(int64) string,
+) (int64, error) {
+	if lowerID < 0 || upperID <= lowerID {
+		return 0, fmt.Errorf("invalid repair range %d..%d", lowerID, upperID)
+	}
+	if count < 1 || count > 64 {
+		return 0, fmt.Errorf("repair shard count %d is outside 1..64", count)
+	}
+	if int64(count) > upperID-lowerID {
+		return 0, errors.New("repair range is smaller than its shard count")
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	var runID int64
+	var cutoff *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT id, cutoff_user_id FROM crawl_runs
+		WHERE status='running' ORDER BY id DESC LIMIT 1
+		FOR UPDATE
+	`).Scan(&runID, &cutoff); err != nil {
+		return 0, err
+	}
+	if cutoff == nil || upperID > *cutoff {
+		return 0, fmt.Errorf(
+			"repair upper ID %d exceeds active run cutoff %v", upperID, cutoff,
+		)
+	}
+	key := fmt.Sprintf(
+		"enumeration_repair:%d:%d:%d:%d", runID, lowerID, upperID, count,
+	)
+	var alreadySeeded bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM runtime_state WHERE key=$1)
+	`, key).Scan(&alreadySeeded); err != nil {
+		return 0, err
+	}
+	if alreadySeeded {
+		return 0, tx.Commit(ctx)
+	}
+
+	span := upperID - lowerID
+	var inserted int64
+	for index := 0; index < count; index++ {
+		lower := lowerID + span*int64(index)/int64(count)
+		upper := lowerID + span*int64(index+1)/int64(count)
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO enumeration_shards (
+			  run_id, purpose, lower_id, upper_id, next_since_id, next_url
+			) VALUES ($1, 'repair', $2, $3, $2, $4)
+			ON CONFLICT DO NOTHING
+		`, runID, lower, upper, urlFor(lower))
+		if err != nil {
+			return 0, err
+		}
+		inserted += tag.RowsAffected()
+	}
+	if inserted != int64(count) {
+		return 0, fmt.Errorf(
+			"repair shard boundaries conflict with existing work: inserted %d of %d",
+			inserted, count,
+		)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE crawl_runs SET enumeration_complete=false WHERE id=$1
+	`, runID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO runtime_state (key,value) VALUES ($1,$2)
+		ON CONFLICT (key) DO NOTHING
+	`, key, fmt.Sprintf("%d..%d", lowerID, upperID)); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO runtime_state (key,value) VALUES ('initial_enumerated','false')
+		ON CONFLICT (key) DO UPDATE SET value=excluded.value, updated_at=now()
+	`); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
 func (s *Store) ClaimEnumerationShard(ctx context.Context, runID int64) (EnumerationShard, error) {
 	row := s.Pool.QueryRow(ctx, `
 		WITH picked AS (
@@ -1250,12 +1348,12 @@ func (s *Store) ClaimEnumerationShard(ctx context.Context, runID int64) (Enumera
 		UPDATE enumeration_shards AS shard
 		SET status='running', attempts=attempts+1, claimed_at=now(), last_error=NULL
 		FROM picked WHERE shard.id=picked.id
-		RETURNING shard.id, shard.run_id, shard.lower_id, shard.upper_id,
+		RETURNING shard.id, shard.run_id, shard.purpose, shard.lower_id, shard.upper_id,
 		          shard.next_since_id, shard.next_url, shard.attempts, shard.enumerated_users,
 		          picked.coverage_generation_id
 	`, runID)
 	var shard EnumerationShard
-	err := row.Scan(&shard.ID, &shard.RunID, &shard.LowerID, &shard.UpperID,
+	err := row.Scan(&shard.ID, &shard.RunID, &shard.Purpose, &shard.LowerID, &shard.UpperID,
 		&shard.NextSinceID, &shard.NextURL, &shard.Attempts, &shard.EnumeratedUsers,
 		&shard.CoverageGenerationID)
 	return shard, err
@@ -1374,13 +1472,13 @@ func (s *Store) RebalanceOwnedEnumerationShard(
 	defer tx.Rollback(ctx)
 
 	var nextSince, originalUpper int64
-	var status string
+	var status, purpose string
 	if err := tx.QueryRow(ctx, `
-		SELECT next_since_id, upper_id, status
+		SELECT next_since_id, upper_id, status, purpose
 		FROM enumeration_shards
 		WHERE id = $1 AND run_id = $2
 		FOR UPDATE
-	`, shard.ID, shard.RunID).Scan(&nextSince, &originalUpper, &status); err != nil {
+	`, shard.ID, shard.RunID).Scan(&nextSince, &originalUpper, &status, &purpose); err != nil {
 		return shard.UpperID, err
 	}
 	if status != "running" {
@@ -1420,9 +1518,9 @@ func (s *Store) RebalanceOwnedEnumerationShard(
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO enumeration_shards (
-			  run_id, lower_id, upper_id, next_since_id, next_url
-			) VALUES ($1, $2, $3, $2, $4)
-		`, shard.RunID, lower, upper, urlFor(lower)); err != nil {
+			  run_id, purpose, lower_id, upper_id, next_since_id, next_url
+			) VALUES ($1, $2, $3, $4, $3, $5)
+		`, shard.RunID, purpose, lower, upper, urlFor(lower)); err != nil {
 			return originalUpper, err
 		}
 	}
@@ -3850,9 +3948,11 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		"ranges":    []map[string]any{},
 	}
 	var remainingShardIDs, observedShardIDs, observedShardUsers int64
+	var repairEnumeratedUsers, repairRemainingIDs int64
+	var repairShards, repairShardsCompleted, repairShardsRemaining int
 	if len(runs) > 0 {
 		shardRows, err := s.Pool.Query(ctx, `
-			SELECT id, lower_id, upper_id, next_since_id, status,
+			SELECT id, purpose, lower_id, upper_id, next_since_id, status,
 			       enumerated_users, attempts
 			FROM enumeration_shards
 			WHERE run_id = $1
@@ -3866,10 +3966,10 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		remaining := 0
 		for shardRows.Next() {
 			var id, lowerID, upperID, nextSince, enumerated int64
-			var status string
+			var purpose, status string
 			var attempts int
 			if err := shardRows.Scan(
-				&id, &lowerID, &upperID, &nextSince, &status,
+				&id, &purpose, &lowerID, &upperID, &nextSince, &status,
 				&enumerated, &attempts,
 			); err != nil {
 				shardRows.Close()
@@ -3883,8 +3983,19 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 				observedShardUsers += enumerated
 				remainingShardIDs += max(int64(0), upperID-nextSince)
 			}
+			if purpose == "repair" {
+				repairShards++
+				repairEnumeratedUsers += enumerated
+				if status == "completed" {
+					repairShardsCompleted++
+				} else {
+					repairShardsRemaining++
+					repairRemainingIDs += max(int64(0), upperID-nextSince)
+				}
+			}
 			ranges = append(ranges, map[string]any{
-				"id": id, "lower_id": lowerID, "upper_id": upperID,
+				"id": id, "purpose": purpose,
+				"lower_id": lowerID, "upper_id": upperID,
 				"next_since_id": nextSince, "status": status,
 				"enumerated_users": enumerated, "attempts": attempts,
 			})
@@ -3897,6 +4008,12 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		shardStatus = map[string]any{
 			"count": len(ranges), "completed": completed,
 			"remaining": remaining, "ranges": ranges,
+			"repair": map[string]any{
+				"shards": repairShards, "completed": repairShardsCompleted,
+				"remaining":              repairShardsRemaining,
+				"enumerated_users":       repairEnumeratedUsers,
+				"remaining_id_positions": repairRemainingIDs,
+			},
 		}
 	}
 	queueRows, err := s.Pool.Query(ctx, `
@@ -4151,10 +4268,16 @@ func (s *Store) Status(ctx context.Context) (map[string]any, error) {
 		}
 	}
 	progress := map[string]any{
-		"phase":                     "starting",
-		"rest_fallback_users":       restFallbackJobs,
-		"percentage":                nil,
-		"percentage_available_when": "account enumeration for the active run is complete",
+		"phase":                              "starting",
+		"rest_fallback_users":                restFallbackJobs,
+		"historical_repair_active":           repairShardsRemaining > 0,
+		"historical_repair_shards":           repairShards,
+		"historical_repair_shards_completed": repairShardsCompleted,
+		"historical_repair_shards_remaining": repairShardsRemaining,
+		"historical_repair_enumerated_users": repairEnumeratedUsers,
+		"historical_repair_remaining_ids":    repairRemainingIDs,
+		"percentage":                         nil,
+		"percentage_available_when":          "account enumeration for the active run is complete",
 	}
 	firstPassStatus := map[string]any{
 		"status":                    "starting",

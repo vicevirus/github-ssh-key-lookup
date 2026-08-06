@@ -8,6 +8,7 @@ import (
 	"github.com/local/github-ssh-index/internal/githubapi"
 	"github.com/local/github-ssh-index/internal/model"
 	"github.com/local/github-ssh-index/internal/sshkey"
+	"github.com/local/github-ssh-index/internal/store"
 )
 
 func TestNormalizeUsersRejectsReorderedNodes(t *testing.T) {
@@ -27,6 +28,63 @@ func TestNormalizeUsersPreservesNullNode(t *testing.T) {
 	}
 	if len(results) != 1 || results[0] != nil || resultErrors[0] != nil {
 		t.Fatalf("unexpected results: %#v", results)
+	}
+}
+
+func TestPlanEnumerationPageRequiresProvenPaginationContinuity(t *testing.T) {
+	shard := store.EnumerationShard{
+		NextSinceID: 100, NextURL: "https://api.github.test/users?since=100&per_page=100",
+		UpperID: 200,
+	}
+	page := githubapi.UsersPage{
+		Objects: []githubapi.RESTUser{
+			{ID: 101, NodeID: "U_101", Login: "alice", Type: "User"},
+			{ID: 102, NodeID: "U_102", Login: "bob", Type: "User"},
+		},
+		NextURL: "https://api.github.test/users?since=102&per_page=100",
+	}
+	candidates, nextSince, nextURL, complete, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	)
+	if err != nil || complete || nextSince != 102 || nextURL != page.NextURL ||
+		len(candidates) != 2 {
+		t.Fatalf("valid page rejected: candidates=%#v since=%d url=%q complete=%t err=%v",
+			candidates, nextSince, nextURL, complete, err)
+	}
+
+	page.NextURL = ""
+	if _, _, _, _, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	); err == nil {
+		t.Fatal("nonterminal page without a next link was accepted")
+	}
+	page.NextURL = "https://api.github.test/users?since=999&per_page=100"
+	if _, _, _, _, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	); err == nil {
+		t.Fatal("page with a mismatched next cursor was accepted")
+	}
+	page.Objects = nil
+	if _, _, _, _, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	); err == nil {
+		t.Fatal("empty page before a fixed boundary was accepted")
+	}
+}
+
+func TestPlanEnumerationPageCompletesOnlyAfterCrossingBoundary(t *testing.T) {
+	shard := store.EnumerationShard{NextSinceID: 190, NextURL: "current", UpperID: 200}
+	page := githubapi.UsersPage{Objects: []githubapi.RESTUser{
+		{ID: 199, NodeID: "U_199", Login: "inside", Type: "User"},
+		{ID: 201, NodeID: "U_201", Login: "outside", Type: "User"},
+	}}
+	candidates, nextSince, nextURL, complete, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	)
+	if err != nil || !complete || nextSince != 200 || nextURL != "boundary" ||
+		len(candidates) != 1 || candidates[0].GitHubID != 199 {
+		t.Fatalf("boundary was not handled safely: candidates=%#v since=%d url=%q complete=%t err=%v",
+			candidates, nextSince, nextURL, complete, err)
 	}
 }
 
