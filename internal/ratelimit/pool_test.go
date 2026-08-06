@@ -39,3 +39,26 @@ func TestPoolWaitSkipsInactiveCredential(t *testing.T) {
 		t.Fatalf("inactive credential selected: lane=%d err=%v", lane, err)
 	}
 }
+
+func TestPoolWaitLaneDoesNotSpillIntoAnotherCredential(t *testing.T) {
+	pool := NewPool(2, 5_000, 100)
+	pool.Cooldown(0, 25*time.Millisecond)
+	started := time.Now()
+	if err := pool.WaitLane(context.Background(), 0, func(int) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("cooled lane returned too early after %s", elapsed)
+	}
+	if got := pool.Snapshot(func(int) bool { return true }).Lanes[1].SecondaryStrikes; got != 0 {
+		t.Fatalf("other credential lane was changed: strikes=%d", got)
+	}
+}
+
+func TestPoolWaitLaneRejectsDisabledCredential(t *testing.T) {
+	pool := NewPool(2, 5_000, 100)
+	err := pool.WaitLane(context.Background(), 0, func(index int) bool { return index != 0 })
+	if err == nil {
+		t.Fatal("expected disabled credential error")
+	}
+}

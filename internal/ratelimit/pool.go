@@ -81,6 +81,25 @@ func (p *Pool) Wait(ctx context.Context, active func(int) bool) (int, error) {
 	return chosen, nil
 }
 
+// WaitLane reserves a request on one credential lane. Keeping high-volume
+// workers attached to a lane prevents a cooling credential from transferring
+// all of its concurrent work to another credential and triggering a second
+// secondary limit there.
+func (p *Pool) WaitLane(ctx context.Context, lane int, active func(int) bool) error {
+	p.mu.Lock()
+	if lane < 0 || lane >= len(p.lanes) {
+		p.mu.Unlock()
+		return fmt.Errorf("rate-limit credential lane %d is out of range", lane)
+	}
+	if active != nil && !active(lane) {
+		p.mu.Unlock()
+		return fmt.Errorf("rate-limit credential lane %d is disabled", lane)
+	}
+	at := p.lanes[lane].ReserveAfter(p.globalCooldown)
+	p.mu.Unlock()
+	return waitUntil(ctx, at)
+}
+
 func (p *Pool) Observe(lane int, rate model.Rate) {
 	if lane >= 0 && lane < len(p.lanes) {
 		p.lanes[lane].Observe(rate)

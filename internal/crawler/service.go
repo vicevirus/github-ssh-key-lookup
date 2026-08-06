@@ -839,7 +839,7 @@ func (s *Service) keyWorker(ctx context.Context, workerID int) error {
 		for index := range jobs {
 			databaseIDs[index] = jobs[index].GitHubID
 		}
-		requestCtx, lane, err := s.waitGraphQL(ctx)
+		requestCtx, lane, err := s.waitGraphQLLane(ctx, workerID%s.graphql.Len())
 		if err != nil {
 			_ = s.Store.RequeueAccountsAfter(
 				context.Background(), jobs, err, retryDelay(err, maxJobAttempts(jobs)),
@@ -1283,7 +1283,7 @@ func (s *Service) nextQueueClass() string {
 func (s *Service) processOverflow(ctx context.Context, workerID int, job model.OverflowJob) error {
 	worker := fmt.Sprintf("graphql-%d", workerID)
 	role := "SSH key batch worker"
-	requestCtx, lane, err := s.waitGraphQL(ctx)
+	requestCtx, lane, err := s.waitGraphQLLane(ctx, workerID%s.graphql.Len())
 	if err != nil {
 		_ = s.Store.RequeueOverflow(context.Background(), job, err)
 		return nil
@@ -2225,6 +2225,20 @@ func (s *Service) waitGraphQL(ctx context.Context) (context.Context, int, error)
 		return ctx, -1, err
 	}
 	return githubapi.WithCredential(ctx, lane), lane, nil
+}
+
+func (s *Service) waitGraphQLLane(
+	ctx context.Context, preferred int,
+) (context.Context, int, error) {
+	if s.GitHub.CredentialActive(preferred) {
+		if err := s.graphql.WaitLane(ctx, preferred, s.GitHub.CredentialActive); err != nil {
+			return ctx, -1, err
+		}
+		return githubapi.WithCredential(ctx, preferred), preferred, nil
+	}
+	// Authentication failures permanently disable a credential. In that case,
+	// fail over so the crawl continues; temporary cooldowns stay lane-local.
+	return s.waitGraphQL(ctx)
 }
 
 func (s *Service) observeGraphQL(ctx context.Context, lane int, rate model.Rate) {
