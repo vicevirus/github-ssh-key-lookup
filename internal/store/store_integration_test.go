@@ -1208,6 +1208,42 @@ func TestSeedEnumerationRepairIsDurableContiguousAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestClaimEnumerationShardPrioritizesHistoricalRepair(t *testing.T) {
+	database := integrationStore(t)
+	ctx := context.Background()
+	run, err := database.EnsureMainRun(
+		ctx, "https://api.github.com/users?since=0&per_page=100",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InitializeLiveTail(
+		ctx, 1_000, "https://api.github.com/users?since=1000&per_page=100",
+	); err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.ActiveMainRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlFor := func(since int64) string {
+		return "https://api.github.com/users?since=" + strconv.FormatInt(since, 10)
+	}
+	if err := database.EnsureEnumerationShards(ctx, run, 2, urlFor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SeedEnumerationRepair(ctx, 101, 901, 2, urlFor); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimEnumerationShard(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Purpose != "repair" || claimed.LowerID != 101 {
+		t.Fatalf("claimed %#v, want earliest historical repair shard", claimed)
+	}
+}
+
 func TestOwnedEnumerationShardRebalancesIdleWorkersWithoutGaps(t *testing.T) {
 	database := integrationStore(t)
 	ctx := context.Background()

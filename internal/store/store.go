@@ -1343,7 +1343,8 @@ func (s *Store) ClaimEnumerationShard(ctx context.Context, runID int64) (Enumera
 			FROM enumeration_shards AS shard
 			JOIN crawl_runs AS run ON run.id=shard.run_id
 			WHERE shard.run_id = $1 AND shard.status IN ('pending','retry')
-			ORDER BY shard.id FOR UPDATE OF shard SKIP LOCKED LIMIT 1
+			ORDER BY CASE shard.purpose WHEN 'repair' THEN 0 ELSE 1 END, shard.id
+			FOR UPDATE OF shard SKIP LOCKED LIMIT 1
 		)
 		UPDATE enumeration_shards AS shard
 		SET status='running', attempts=attempts+1, claimed_at=now(), last_error=NULL
