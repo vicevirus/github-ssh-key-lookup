@@ -359,13 +359,6 @@ func planEnumerationPage(
 	if shard.NextSinceID >= shard.UpperID {
 		return nil, shard.UpperID, urlFor(shard.UpperID), true, nil
 	}
-	if len(page.Objects) == 0 {
-		return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
-			"empty REST users page before shard boundary: since=%d upper=%d",
-			shard.NextSinceID, shard.UpperID,
-		)
-	}
-
 	candidates := make([]model.Candidate, 0, len(page.Objects))
 	previous := shard.NextSinceID
 	crossedBoundary := false
@@ -408,13 +401,21 @@ func planEnumerationPage(
 			fmt.Errorf("parse REST users next link: %w", err)
 	}
 	linkSince, err := strconv.ParseInt(next.Query().Get("since"), 10, 64)
-	if err != nil || linkSince != previous {
+	if err != nil || linkSince <= shard.NextSinceID || linkSince < previous {
 		return nil, shard.NextSinceID, shard.NextURL, false, fmt.Errorf(
-			"REST users next cursor does not match page: link_since=%q last=%d",
-			next.Query().Get("since"), previous,
+			"REST users next cursor does not prove forward continuity: current=%d link_since=%q last=%d",
+			shard.NextSinceID, next.Query().Get("since"), previous,
 		)
 	}
-	return candidates, previous, page.NextURL, false, nil
+	// GitHub's server-issued cursor can be ahead of the last returned object.
+	// The underlying ID stream also contains identities that /users does not
+	// return (for example ProgrammaticAccessBot), so equality is not guaranteed.
+	// The Link cursor is authoritative as long as it moves forward and never
+	// falls behind an object that was actually returned.
+	if linkSince >= shard.UpperID {
+		return candidates, shard.UpperID, urlFor(shard.UpperID), true, nil
+	}
+	return candidates, linkSince, page.NextURL, false, nil
 }
 
 func (s *Service) enumerateMain(ctx context.Context) error {

@@ -58,17 +58,68 @@ func TestPlanEnumerationPageRequiresProvenPaginationContinuity(t *testing.T) {
 	); err == nil {
 		t.Fatal("nonterminal page without a next link was accepted")
 	}
-	page.NextURL = "https://api.github.test/users?since=999&per_page=100"
+	page.NextURL = "https://api.github.test/users?since=101&per_page=100"
 	if _, _, _, _, err := planEnumerationPage(
 		shard, page, func(id int64) string { return "boundary" },
 	); err == nil {
-		t.Fatal("page with a mismatched next cursor was accepted")
+		t.Fatal("page with a regressing next cursor was accepted")
 	}
 	page.Objects = nil
+	page.NextURL = ""
 	if _, _, _, _, err := planEnumerationPage(
 		shard, page, func(id int64) string { return "boundary" },
 	); err == nil {
-		t.Fatal("empty page before a fixed boundary was accepted")
+		t.Fatal("empty page without a forward next cursor was accepted")
+	}
+}
+
+func TestPlanEnumerationPageUsesForwardServerCursor(t *testing.T) {
+	shard := store.EnumerationShard{
+		NextSinceID: 100, NextURL: "https://api.github.test/users?since=100&per_page=100",
+		UpperID: 200,
+	}
+	page := githubapi.UsersPage{
+		Objects: []githubapi.RESTUser{
+			{ID: 101, NodeID: "U_101", Login: "alice", Type: "User"},
+			{ID: 102, NodeID: "U_102", Login: "bob", Type: "User"},
+		},
+		NextURL: "https://api.github.test/users?since=105&per_page=100",
+	}
+	candidates, nextSince, nextURL, complete, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	)
+	if err != nil || complete || nextSince != 105 || nextURL != page.NextURL ||
+		len(candidates) != 2 {
+		t.Fatalf("forward server cursor rejected: candidates=%#v since=%d url=%q complete=%t err=%v",
+			candidates, nextSince, nextURL, complete, err)
+	}
+
+	page.Objects = nil
+	page.NextURL = "https://api.github.test/users?since=110&per_page=100"
+	candidates, nextSince, _, complete, err = planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	)
+	if err != nil || complete || nextSince != 110 || len(candidates) != 0 {
+		t.Fatalf("empty filtered page with forward cursor rejected: since=%d complete=%t err=%v",
+			nextSince, complete, err)
+	}
+}
+
+func TestPlanEnumerationPageCompletesWhenServerCursorCrossesBoundary(t *testing.T) {
+	shard := store.EnumerationShard{NextSinceID: 190, NextURL: "current", UpperID: 200}
+	page := githubapi.UsersPage{
+		Objects: []githubapi.RESTUser{
+			{ID: 195, NodeID: "U_195", Login: "inside", Type: "User"},
+		},
+		NextURL: "https://api.github.test/users?since=201&per_page=100",
+	}
+	candidates, nextSince, nextURL, complete, err := planEnumerationPage(
+		shard, page, func(id int64) string { return "boundary" },
+	)
+	if err != nil || !complete || nextSince != 200 || nextURL != "boundary" ||
+		len(candidates) != 1 {
+		t.Fatalf("server cursor boundary crossing rejected: candidates=%#v since=%d url=%q complete=%t err=%v",
+			candidates, nextSince, nextURL, complete, err)
 	}
 }
 
